@@ -89,6 +89,7 @@ struct bench_args {
 	int verify_min_sectors;
 	int verify_max_sectors;
 	bool verify_inject_fault;
+	int eta_interval; /* seconds between progress lines; 0 = disabled */
 };
 
 /* ── Worker context ────────────────────────────────────────────────── */
@@ -839,6 +840,122 @@ static void *worker_thread(void *arg)
 	return NULL;
 }
 
+/* ── Forward declarations for reporter ─────────────────────────────── */
+
+static void format_iops(double iops, char *buf, size_t len);
+static bool mode_is_mixed(enum rw_mode m);
+static bool mode_is_write_only(enum rw_mode m);
+
+/* ── Progress reporter thread ──────────────────────────────────────── */
+
+struct reporter_ctx {
+	struct worker_ctx *workers;
+	struct bench_args *args;
+	uint64_t measure_start_ns; /* start of measurement (after ramp) */
+	atomic_bool stop;
+};
+
+static void *reporter_thread(void *arg)
+{
+	struct reporter_ctx *r = arg;
+	struct bench_args *a = r->args;
+	int nj = a->numjobs;
+	int interval_ms = a->eta_interval * 1000;
+	bool is_mixed = mode_is_mixed(a->rw);
+	uint64_t measure_start = r->measure_start_ns;
+
+	/* Sleep through ramp period */
+	while (now_ns() < measure_start) {
+		if (atomic_load_explicit(&r->stop, memory_order_relaxed))
+			return NULL;
+		struct timespec ramp_ts = {0, 100 * 1000000L}; /* 100ms */
+		nanosleep(&ramp_ts, NULL);
+	}
+
+	/* Previous snapshot for delta computation */
+	uint64_t prev_ios = 0, prev_bytes = 0;
+	uint64_t prev_read_bytes = 0, prev_write_bytes = 0;
+	uint64_t prev_read_ios = 0, prev_write_ios = 0;
+
+	while (!atomic_load_explicit(&r->stop, memory_order_relaxed)) {
+		struct timespec ts = {
+		    .tv_sec = interval_ms / 1000,
+		    .tv_nsec = (long)(interval_ms % 1000) * 1000000L,
+		};
+		nanosleep(&ts, NULL);
+
+		if (atomic_load_explicit(&r->stop, memory_order_relaxed))
+			break;
+
+		/* Snapshot worker counters (slight races acceptable for display) */
+		uint64_t cur_ios = 0, cur_bytes = 0;
+		uint64_t cur_read_bytes = 0, cur_write_bytes = 0;
+		uint64_t cur_read_ios = 0, cur_write_ios = 0;
+		for (int i = 0; i < nj; i++) {
+			cur_ios += r->workers[i].stats.ios_done;
+			cur_bytes += r->workers[i].stats.bytes_done;
+			cur_read_bytes += r->workers[i].stats.read_bytes;
+			cur_write_bytes += r->workers[i].stats.write_bytes;
+			cur_read_ios += r->workers[i].stats.read_ios;
+			cur_write_ios += r->workers[i].stats.write_ios;
+		}
+
+		uint64_t t = now_ns();
+		double elapsed_sec = (double)(t - measure_start) / (double)NS_PER_SEC;
+
+		/* Delta stats for this interval */
+		uint64_t d_ios = cur_ios - prev_ios;
+		uint64_t d_bytes = cur_bytes - prev_bytes;
+		double interval_sec = (double)a->eta_interval;
+		double iops = (double)d_ios / interval_sec;
+		double bw_mib = (double)d_bytes / interval_sec / (1024.0 * 1024.0);
+
+		/* Progress and ETA */
+		double pct = elapsed_sec / (double)a->runtime * 100.0;
+		if (pct > 100.0)
+			pct = 100.0;
+		double remain = (double)a->runtime - elapsed_sec;
+		if (remain < 0)
+			remain = 0;
+		int eta_min = (int)remain / 60;
+		int eta_sec = (int)remain % 60;
+
+		char iops_str[32];
+		format_iops(iops, iops_str, sizeof(iops_str));
+
+		if (is_mixed) {
+			uint64_t d_rbytes = cur_read_bytes - prev_read_bytes;
+			uint64_t d_wbytes = cur_write_bytes - prev_write_bytes;
+			uint64_t d_rios = cur_read_ios - prev_read_ios;
+			uint64_t d_wios = cur_write_ios - prev_write_ios;
+			double r_bw = (double)d_rbytes / interval_sec / (1024.0 * 1024.0);
+			double w_bw = (double)d_wbytes / interval_sec / (1024.0 * 1024.0);
+			char r_iops_str[32], w_iops_str[32];
+			format_iops((double)d_rios / interval_sec, r_iops_str, sizeof(r_iops_str));
+			format_iops((double)d_wios / interval_sec, w_iops_str, sizeof(w_iops_str));
+			fprintf(stderr,
+				"[%3.0fs][%5.1f%%] r=%.0fMiB/s %s IOPS, "
+				"w=%.0fMiB/s %s IOPS [eta %02dm:%02ds]\n",
+				elapsed_sec, pct, r_bw, r_iops_str, w_bw, w_iops_str, eta_min,
+				eta_sec);
+		} else {
+			const char *dir = mode_is_write_only(a->rw) ? "w" : "r";
+			fprintf(stderr,
+				"[%3.0fs][%5.1f%%] %s=%.0fMiB/s, %s IOPS [eta %02dm:%02ds]\n",
+				elapsed_sec, pct, dir, bw_mib, iops_str, eta_min, eta_sec);
+		}
+
+		prev_ios = cur_ios;
+		prev_bytes = cur_bytes;
+		prev_read_bytes = cur_read_bytes;
+		prev_write_bytes = cur_write_bytes;
+		prev_read_ios = cur_read_ios;
+		prev_write_ios = cur_write_ios;
+	}
+
+	return NULL;
+}
+
 /* ── CPU usage from /proc/self/stat ────────────────────────────────── */
 
 static void read_cpu_usage(struct cpu_usage *c)
@@ -1166,9 +1283,11 @@ static void usage(void)
 		"libblkio options:\n"
 		"  --driver NAME         libblkio driver (default: virtio-blk-vhost-user)\n"
 		"  --queue-size N        Virtio queue size (default: 256)\n"
+		"  --direct 0|1          Use direct I/O, bypass page cache (default: 1)\n"
 		"\n"
 		"Output options:\n"
 		"  --output-format FMT   Output format: normal, json (default: normal)\n"
+		"  --eta-interval SEC    Progress line interval; 0=disabled (default: 2)\n"
 		"\n"
 		"  --help                Show this help\n"
 		"  --version             Show version\n");
@@ -1197,6 +1316,7 @@ int main(int argc, char **argv)
 	    .verify_min_sectors = 1,
 	    .verify_max_sectors = 16,
 	    .verify_inject_fault = false,
+	    .eta_interval = 2,
 	};
 	bool rw_set = false;
 
@@ -1217,6 +1337,7 @@ int main(int argc, char **argv)
 	    {"output-format", required_argument, 0, 'F'},
 	    {"verify-sectors", required_argument, 0, 'E'},
 	    {"direct", required_argument, 0, 'O'},
+	    {"eta-interval", required_argument, 0, 'e'},
 	    {"verify-inject-fault", no_argument, 0, 'I'},
 	    {"help", no_argument, 0, 'h'},
 	    {"version", no_argument, 0, 'V'},
@@ -1301,6 +1422,9 @@ int main(int argc, char **argv)
 		}
 		case 'O':
 			args.direct = atoi(optarg);
+			break;
+		case 'e':
+			args.eta_interval = atoi(optarg);
 			break;
 		case 'I':
 			args.verify_inject_fault = true;
@@ -1536,8 +1660,29 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* ── Start progress reporter (non-verify modes, eta_interval > 0) ── */
+	struct reporter_ctx rctx = {0};
+	pthread_t reporter_tid;
+	bool reporter_running = false;
+	if (!is_verify && args.eta_interval > 0) {
+		rctx.workers = workers;
+		rctx.args = &args;
+		rctx.measure_start_ns = bench_start_ns + (uint64_t)args.ramp_time * NS_PER_SEC;
+		atomic_store_explicit(&rctx.stop, false, memory_order_relaxed);
+		ret = pthread_create(&reporter_tid, NULL, reporter_thread, &rctx);
+		if (ret == 0)
+			reporter_running = true;
+	}
+
 	for (int i = 0; i < args.numjobs; i++)
 		pthread_join(threads[i], NULL);
+
+	/* Stop reporter before aggregating results */
+	if (reporter_running) {
+		atomic_store_explicit(&rctx.stop, true, memory_order_relaxed);
+		pthread_join(reporter_tid, NULL);
+	}
+
 	uint64_t bench_end_ns = now_ns();
 
 	read_cpu_usage(&cpu_after);
@@ -1557,8 +1702,7 @@ int main(int argc, char **argv)
 		       (unsigned long)total.write_ios, (unsigned long)total.read_ios,
 		       (unsigned long)total.errors);
 	} else {
-		double wall_sec = (double)(bench_end_ns - bench_start_ns) /
-				  (double)NS_PER_SEC -
+		double wall_sec = (double)(bench_end_ns - bench_start_ns) / (double)NS_PER_SEC -
 				  (double)args.ramp_time;
 		if (wall_sec < 0.001)
 			wall_sec = 0.001;

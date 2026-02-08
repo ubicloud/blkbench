@@ -81,12 +81,14 @@ Used with `--rw verify-flush` and `--rw verify-pipeline` modes.
 |-----|---------|-------------|
 | `--driver NAME` | `virtio-blk-vhost-user` | libblkio driver name (e.g., `io_uring`, `virtio-blk-vhost-user`) |
 | `--queue-size N` | `256` | Virtio queue size |
+| `--direct 0\|1` | `1` | Use direct I/O, bypass page cache |
 
 ### Output Options
 
 | Arg | Default | Description |
 |-----|---------|-------------|
 | `--output-format FMT` | `normal` | Output format: `normal` or `json` |
+| `--eta-interval SEC` | `2` | Progress line interval to stderr; `0` disables |
 | `--help` | | Show usage information |
 | `--version` | | Show version |
 
