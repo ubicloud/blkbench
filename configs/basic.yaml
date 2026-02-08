@@ -1,0 +1,5 @@
+path: "/tmp/test-disk.raw"
+socket: "/tmp/vhost.sock"
+num_queues: 1
+queue_size: 64
+io_engine: "io_uring"

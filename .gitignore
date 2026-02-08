@@ -1,0 +1,14 @@
+lblk-bench
+poc
+test_hist
+*.o
+*.raw
+*.swp
+*~
+.beads/
+logs/
+walk-local
+walk-tail
+seed*.md
+epic.md
+AGENTS.md
