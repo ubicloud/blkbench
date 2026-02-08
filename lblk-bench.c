@@ -39,6 +39,7 @@ enum rw_mode {
 	RW_READWRITE,
 	RW_RANDRW,
 	RW_VERIFY_FLUSH,
+	RW_VERIFY_PIPELINE,
 };
 
 /* ── Per-request slot (passed as user_data) ────────────────────────── */
@@ -278,6 +279,87 @@ struct verify_record {
 	uint32_t crc;
 };
 
+/* ── SPSC ring buffer for verify-pipeline inter-thread handoff ──── */
+
+#define PIPELINE_RING_SIZE 256  /* must be power of 2 */
+
+struct pipeline_entry {
+	uint64_t offset;
+	uint32_t crc;
+};
+
+struct pipeline_ring {
+	_Alignas(64) atomic_uint head;  /* written by producer */
+	_Alignas(64) atomic_uint tail;  /* written by consumer */
+	struct pipeline_entry entries[PIPELINE_RING_SIZE];
+};
+
+static void pipeline_ring_init(struct pipeline_ring *r)
+{
+	atomic_store_explicit(&r->head, 0, memory_order_relaxed);
+	atomic_store_explicit(&r->tail, 0, memory_order_relaxed);
+}
+
+/* Push entry; spins if full. Returns false if stop_flag is set. */
+static bool pipeline_ring_push(struct pipeline_ring *r,
+			       const struct pipeline_entry *e,
+			       const atomic_bool *stop_flag)
+{
+	unsigned h = atomic_load_explicit(&r->head, memory_order_relaxed);
+	for (;;) {
+		unsigned t = atomic_load_explicit(&r->tail, memory_order_acquire);
+		if (h - t < PIPELINE_RING_SIZE)
+			break;
+		if (atomic_load_explicit(stop_flag, memory_order_relaxed))
+			return false;
+		/* spin */
+	}
+	r->entries[h & (PIPELINE_RING_SIZE - 1)] = *e;
+	atomic_store_explicit(&r->head, h + 1, memory_order_release);
+	return true;
+}
+
+/* Pop entry; spins if empty. Returns false if stop_flag is set and ring empty. */
+static bool pipeline_ring_pop(struct pipeline_ring *r,
+			      struct pipeline_entry *e,
+			      const atomic_bool *stop_flag)
+{
+	unsigned t = atomic_load_explicit(&r->tail, memory_order_relaxed);
+	for (;;) {
+		unsigned h = atomic_load_explicit(&r->head, memory_order_acquire);
+		if (h != t)
+			break;
+		if (atomic_load_explicit(stop_flag, memory_order_relaxed))
+			return false;
+		/* spin */
+	}
+	*e = r->entries[t & (PIPELINE_RING_SIZE - 1)];
+	atomic_store_explicit(&r->tail, t + 1, memory_order_release);
+	return true;
+}
+
+/* Non-blocking pop: returns true if an entry was available. */
+static bool pipeline_ring_try_pop(struct pipeline_ring *r,
+				  struct pipeline_entry *e)
+{
+	unsigned t = atomic_load_explicit(&r->tail, memory_order_relaxed);
+	unsigned h = atomic_load_explicit(&r->head, memory_order_acquire);
+	if (h == t)
+		return false;
+	*e = r->entries[t & (PIPELINE_RING_SIZE - 1)];
+	atomic_store_explicit(&r->tail, t + 1, memory_order_release);
+	return true;
+}
+
+/* ── Verify-pipeline shared context ────────────────────────────────── */
+
+struct pipeline_ctx {
+	struct sector_alloc *alloc;
+	struct pipeline_ring *rings;  /* array of numjobs rings */
+	atomic_bool stop_flag;        /* set when runtime expires */
+	int numjobs;
+};
+
 /* ── Verify-flush worker thread ───────────────────────────────────── */
 
 /*
@@ -442,6 +524,153 @@ static void *verify_flush_thread(void *arg)
 
 	free(recs);
 	free(comps);
+	return NULL;
+}
+
+/* ── Verify-pipeline worker thread ─────────────────────────────────── */
+
+static void *verify_pipeline_thread(void *arg)
+{
+	struct worker_ctx *w = arg;
+	struct bench_args *a = w->args;
+	struct blkioq *q = w->queue;
+	unsigned char *base = (unsigned char *)w->region.addr;
+	struct pipeline_ctx *pctx = (struct pipeline_ctx *)(uintptr_t)w->prng_state;
+	uint64_t bs = a->bs;
+	int nj = pctx->numjobs;
+	int me = w->job_index;
+
+	/* Ring I send to: next thread in circular order (or self if nj==1) */
+	struct pipeline_ring *send_ring = &pctx->rings[me];
+	/* Ring I receive from: previous thread */
+	struct pipeline_ring *recv_ring = &pctx->rings[(me - 1 + nj) % nj];
+
+	struct blkio_completion comp;
+	stats_reset(&w->stats);
+
+	uint64_t start_ns = now_ns();
+	uint64_t end_ns = start_ns + (uint64_t)a->runtime * NS_PER_SEC;
+
+	uint64_t total_writes = 0, total_verifies = 0, mismatches = 0;
+
+	/* Use two buffer slots: slot 0 for writing, slot 1 for reading */
+	unsigned char *wbuf = base;
+	unsigned char *rbuf = base + bs;
+
+	while (now_ns() < end_ns) {
+		/* Step 1: Allocate a sector, write it */
+		uint64_t off = sector_alloc_get(pctx->alloc, 1);
+		if (off == UINT64_MAX)
+			break;
+
+		/* Fill with offset-seeded pattern */
+		for (size_t i = 0; i + 8 <= bs; i += 8) {
+			uint64_t val = off + i;
+			memcpy(wbuf + i, &val, 8);
+		}
+
+		uint32_t crc = crc32_compute(wbuf, bs);
+
+		/* Write the sector */
+		blkioq_write(q, off, wbuf, bs, NULL, 0);
+		int errs = do_io_drain(q, &comp, 1, 1);
+		if (errs) {
+			w->stats.errors++;
+			continue;
+		}
+		total_writes++;
+		w->stats.write_ios++;
+		w->stats.write_bytes += bs;
+		w->stats.ios_done++;
+		w->stats.bytes_done += bs;
+
+		/* Step 2: Send (offset, crc) to next thread's ring */
+		struct pipeline_entry e = { .offset = off, .crc = crc };
+		if (nj > 1) {
+			if (!pipeline_ring_push(send_ring, &e, &pctx->stop_flag))
+				break;
+		}
+
+		/* Step 3: Receive (offset, crc) from previous thread and verify */
+		struct pipeline_entry recv;
+		bool got;
+		if (nj == 1) {
+			/* Degenerate: verify our own write immediately */
+			recv = e;
+			got = true;
+		} else {
+			got = pipeline_ring_pop(recv_ring, &recv, &pctx->stop_flag);
+		}
+
+		if (!got)
+			break;
+
+		/* Read the sector */
+		blkioq_read(q, recv.offset, rbuf, bs, NULL, 0);
+		errs = do_io_drain(q, &comp, 1, 1);
+		if (errs) {
+			w->stats.errors++;
+			continue;
+		}
+		w->stats.read_ios++;
+		w->stats.read_bytes += bs;
+		w->stats.ios_done++;
+		w->stats.bytes_done += bs;
+
+		/* Fault injection: flip one byte on first verify */
+		if (a->verify_inject_fault && total_verifies == 0)
+			rbuf[0] ^= 0xFF;
+
+		uint32_t actual_crc = crc32_compute(rbuf, bs);
+		if (actual_crc != recv.crc) {
+			fprintf(stderr, "VERIFY FAIL: job %d, offset %lu: "
+				"expected crc 0x%08x, got 0x%08x\n",
+				me, (unsigned long)recv.offset,
+				recv.crc, actual_crc);
+			mismatches++;
+			w->stats.errors++;
+		}
+		total_verifies++;
+	}
+
+	/* Signal stop so other threads don't spin forever */
+	atomic_store_explicit(&pctx->stop_flag, true, memory_order_relaxed);
+
+	/* Drain any remaining entries from recv ring (verify them) */
+	if (nj > 1) {
+		struct pipeline_entry recv;
+		while (pipeline_ring_try_pop(recv_ring, &recv)) {
+			blkioq_read(q, recv.offset, rbuf, bs, NULL, 0);
+			int errs = do_io_drain(q, &comp, 1, 1);
+			if (errs) {
+				w->stats.errors++;
+				continue;
+			}
+			w->stats.read_ios++;
+			w->stats.read_bytes += bs;
+			w->stats.ios_done++;
+			w->stats.bytes_done += bs;
+
+			uint32_t actual_crc = crc32_compute(rbuf, bs);
+			if (actual_crc != recv.crc) {
+				fprintf(stderr, "VERIFY FAIL: job %d, offset %lu: "
+					"expected crc 0x%08x, got 0x%08x\n",
+					me, (unsigned long)recv.offset,
+					recv.crc, actual_crc);
+				mismatches++;
+				w->stats.errors++;
+			}
+			total_verifies++;
+		}
+	}
+
+	if (mismatches == 0)
+		printf("pipeline job %d: OK - %lu writes, %lu verifies\n",
+		       me, (unsigned long)total_writes, (unsigned long)total_verifies);
+	else
+		printf("pipeline job %d: FAILED - %lu mismatches in %lu verifies\n",
+		       me, (unsigned long)mismatches, (unsigned long)total_verifies);
+
 	return NULL;
 }
 
@@ -662,6 +891,7 @@ static enum rw_mode parse_rw(const char *str)
 	if (!strcmp(str, "readwrite") || !strcmp(str, "rw")) return RW_READWRITE;
 	if (!strcmp(str, "randrw")) return RW_RANDRW;
 	if (!strcmp(str, "verify-flush")) return RW_VERIFY_FLUSH;
+	if (!strcmp(str, "verify-pipeline")) return RW_VERIFY_PIPELINE;
 	fprintf(stderr, "error: unknown --rw mode '%s'\n", str);
 	exit(1);
 }
@@ -675,7 +905,8 @@ static const char *rw_name(enum rw_mode m)
 	case RW_RANDWRITE: return "randwrite";
 	case RW_READWRITE: return "readwrite";
 	case RW_RANDRW:        return "randrw";
-	case RW_VERIFY_FLUSH:  return "verify-flush";
+	case RW_VERIFY_FLUSH:     return "verify-flush";
+	case RW_VERIFY_PIPELINE:  return "verify-pipeline";
 	}
 	return "unknown";
 }
@@ -876,7 +1107,7 @@ static void usage(void)
 "Required:\n"
 "  --path PATH           Device/socket path (meaning depends on --driver)\n"
 "  --rw MODE             I/O pattern: read, write, randread, randwrite,\n"
-"                        readwrite, randrw, verify-flush\n"
+"                        readwrite, randrw, verify-flush, verify-pipeline\n"
 "\n"
 "Workload options:\n"
 "  --bs SIZE             Block size (default: 4k)\n"
@@ -1037,7 +1268,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error: --numjobs must be >= 1\n");
 		return 1;
 	}
-	if (args.runtime < 1 && args.rw != RW_VERIFY_FLUSH) {
+	if (args.runtime < 1 && args.rw != RW_VERIFY_FLUSH && args.rw != RW_VERIFY_PIPELINE) {
 		fprintf(stderr, "error: --runtime must be >= 1\n");
 		return 1;
 	}
@@ -1106,15 +1337,36 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	bool is_verify = (args.rw == RW_VERIFY_FLUSH);
+	bool is_verify_flush = (args.rw == RW_VERIFY_FLUSH);
+	bool is_verify_pipeline = (args.rw == RW_VERIFY_PIPELINE);
+	bool is_verify = is_verify_flush || is_verify_pipeline;
 	size_t region_size;
 	struct sector_alloc sa;
+	struct pipeline_ctx pctx = {0};
 
-	if (is_verify) {
+	if (is_verify_flush) {
 		crc32_init();
 		/* Each slot needs verify_max_sectors * bs for multi-sector regions */
 		region_size = (size_t)args.iodepth * (size_t)args.verify_max_sectors * args.bs;
 		sector_alloc_init(&sa, args.offset, args.size, args.bs);
+	} else if (is_verify_pipeline) {
+		crc32_init();
+		/* Need 2 buffer slots per worker: one for write, one for read */
+		region_size = 2 * args.bs;
+		sector_alloc_init(&sa, args.offset, args.size, args.bs);
+		pctx.alloc = &sa;
+		pctx.numjobs = args.numjobs;
+		atomic_store(&pctx.stop_flag, false);
+		pctx.rings = calloc(args.numjobs, sizeof(struct pipeline_ring));
+		if (!pctx.rings) {
+			fprintf(stderr, "error: alloc pipeline rings failed\n");
+			free(workers);
+			free(threads);
+			blkio_destroy(&b);
+			return 1;
+		}
+		for (int i = 0; i < args.numjobs; i++)
+			pipeline_ring_init(&pctx.rings[i]);
 	} else {
 		region_size = (size_t)args.iodepth * args.bs;
 	}
@@ -1122,8 +1374,10 @@ int main(int argc, char **argv)
 	for (int i = 0; i < args.numjobs; i++) {
 		workers[i].job_index = i;
 		workers[i].args = &args;
-		if (is_verify)
+		if (is_verify_flush)
 			workers[i].prng_state = (uint64_t)(uintptr_t)&sa;
+		else if (is_verify_pipeline)
+			workers[i].prng_state = (uint64_t)(uintptr_t)&pctx;
 		else
 			workers[i].prng_state = 0x853c49e6748fea9bULL ^ (uint64_t)(i + 1);
 		workers[i].seq_offset = 0;
@@ -1177,7 +1431,9 @@ int main(int argc, char **argv)
 	struct cpu_usage cpu_before, cpu_after;
 	read_cpu_usage(&cpu_before);
 
-	void *(*thread_fn)(void *) = is_verify ? verify_flush_thread : worker_thread;
+	void *(*thread_fn)(void *) = is_verify_flush ? verify_flush_thread
+				   : is_verify_pipeline ? verify_pipeline_thread
+				   : worker_thread;
 	for (int i = 0; i < args.numjobs; i++) {
 		ret = pthread_create(&threads[i], NULL, thread_fn, &workers[i]);
 		if (ret) {
@@ -1211,11 +1467,14 @@ int main(int argc, char **argv)
 	for (int i = 0; i < args.numjobs; i++)
 		stats_merge(&total, &workers[i].stats);
 
-	if (is_verify) {
-		/* Verify mode: summary already printed per-thread; show totals */
+	if (is_verify_flush) {
 		printf("verify-flush: %lu writes, %lu reads, %lu errors, %lu flushes\n",
 		       (unsigned long)total.write_ios, (unsigned long)total.read_ios,
 		       (unsigned long)total.errors, (unsigned long)total.flushes);
+	} else if (is_verify_pipeline) {
+		printf("verify-pipeline: %lu writes, %lu reads, %lu errors\n",
+		       (unsigned long)total.write_ios, (unsigned long)total.read_ios,
+		       (unsigned long)total.errors);
 	} else {
 		double wall_sec = (double)args.runtime;
 
@@ -1233,6 +1492,8 @@ int main(int argc, char **argv)
 	}
 	if (is_verify)
 		sector_alloc_destroy(&sa);
+	if (is_verify_pipeline)
+		free(pctx.rings);
 	free(workers);
 	free(threads);
 	blkio_destroy(&b);
