@@ -1493,12 +1493,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (args.direct >= 0) {
+	if (args.direct >= 0 && !strcmp(args.driver, "io_uring")) {
 		ret = blkio_set_bool(b, "direct", args.direct != 0);
 		if (ret < 0) {
-			fprintf(stderr, "warning: blkio_set_bool(direct): %s\n",
+			fprintf(stderr, "error: blkio_set_bool(direct): %s\n",
 				blkio_get_error_msg());
-			/* Non-fatal: not all drivers support direct */
+			blkio_destroy(&b);
+			return 1;
 		}
 	}
 
