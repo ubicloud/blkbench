@@ -85,6 +85,7 @@ struct bench_args {
 	int sync_n;
 	int queue_size;
 	bool json_output;
+	int direct;
 	int verify_min_sectors;
 	int verify_max_sectors;
 	bool verify_inject_fault;
@@ -1192,6 +1193,7 @@ int main(int argc, char **argv)
 	    .sync_n = 0,
 	    .queue_size = 256,
 	    .json_output = false,
+	    .direct = 1,
 	    .verify_min_sectors = 1,
 	    .verify_max_sectors = 16,
 	    .verify_inject_fault = false,
@@ -1214,6 +1216,7 @@ int main(int argc, char **argv)
 	    {"queue-size", required_argument, 0, 'Q'},
 	    {"output-format", required_argument, 0, 'F'},
 	    {"verify-sectors", required_argument, 0, 'E'},
+	    {"direct", required_argument, 0, 'O'},
 	    {"verify-inject-fault", no_argument, 0, 'I'},
 	    {"help", no_argument, 0, 'h'},
 	    {"version", no_argument, 0, 'V'},
@@ -1296,6 +1299,9 @@ int main(int argc, char **argv)
 			}
 			break;
 		}
+		case 'O':
+			args.direct = atoi(optarg);
+			break;
 		case 'I':
 			args.verify_inject_fault = true;
 			break;
@@ -1361,6 +1367,15 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error: blkio_set_str(path): %s\n", blkio_get_error_msg());
 		blkio_destroy(&b);
 		return 1;
+	}
+
+	if (args.direct >= 0) {
+		ret = blkio_set_bool(b, "direct", args.direct != 0);
+		if (ret < 0) {
+			fprintf(stderr, "warning: blkio_set_bool(direct): %s\n",
+				blkio_get_error_msg());
+			/* Non-fatal: not all drivers support direct */
+		}
 	}
 
 	ret = blkio_connect(b);
@@ -1499,6 +1514,7 @@ int main(int argc, char **argv)
 	void *(*thread_fn)(void *) = is_verify_flush	  ? verify_flush_thread
 				     : is_verify_pipeline ? verify_pipeline_thread
 							  : worker_thread;
+	uint64_t bench_start_ns = now_ns();
 	for (int i = 0; i < args.numjobs; i++) {
 		ret = pthread_create(&threads[i], NULL, thread_fn, &workers[i]);
 		if (ret) {
@@ -1522,6 +1538,7 @@ int main(int argc, char **argv)
 
 	for (int i = 0; i < args.numjobs; i++)
 		pthread_join(threads[i], NULL);
+	uint64_t bench_end_ns = now_ns();
 
 	read_cpu_usage(&cpu_after);
 
@@ -1540,7 +1557,11 @@ int main(int argc, char **argv)
 		       (unsigned long)total.write_ios, (unsigned long)total.read_ios,
 		       (unsigned long)total.errors);
 	} else {
-		double wall_sec = (double)args.runtime;
+		double wall_sec = (double)(bench_end_ns - bench_start_ns) /
+				  (double)NS_PER_SEC -
+				  (double)args.ramp_time;
+		if (wall_sec < 0.001)
+			wall_sec = 0.001;
 
 		/* ── Print results ── */
 		if (args.json_output)
