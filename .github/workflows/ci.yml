@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubicloud-standard-4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang-format \
+            meson ninja-build python3-pip jq bc
+
+      - name: Install libblkio from source
+        run: |
+          git clone https://gitlab.com/libblkio/libblkio.git /tmp/libblkio
+          cd /tmp/libblkio
+          meson setup build
+          ninja -C build
+          sudo ninja -C build install
+          sudo ldconfig
+
+      - name: Build
+        run: make
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: CLI tests
+        run: make test-cli
+
+      - name: Integration smoke test
+        run: make test-smoke

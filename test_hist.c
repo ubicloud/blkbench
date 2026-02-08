@@ -58,14 +58,15 @@ static uint64_t percentile_from_hist(const uint64_t *hist, uint64_t total, doubl
 static int tests_run = 0;
 static int tests_passed = 0;
 
-#define CHECK(cond, fmt, ...) do { \
-	tests_run++; \
-	if (cond) { \
-		tests_passed++; \
-	} else { \
-		printf("FAIL: " fmt "\n", ##__VA_ARGS__); \
-	} \
-} while(0)
+#define CHECK(cond, fmt, ...)                                                                      \
+	do {                                                                                       \
+		tests_run++;                                                                       \
+		if (cond) {                                                                        \
+			tests_passed++;                                                            \
+		} else {                                                                           \
+			printf("FAIL: " fmt "\n", ##__VA_ARGS__);                                  \
+		}                                                                                  \
+	} while (0)
 
 /* ── Tests ────────────────────────────────────────────────────── */
 
@@ -118,8 +119,8 @@ static void test_bucket_boundaries(void)
 	CHECK(hist_bucket(NS_PER_SEC) == 20, "1s -> bucket 20 (got %d)", hist_bucket(NS_PER_SEC));
 
 	/* Very large values should cap at HIST_BUCKETS-1 = 31 */
-	CHECK(hist_bucket(UINT64_MAX) == HIST_BUCKETS - 1,
-	      "UINT64_MAX -> bucket 31 (got %d)", hist_bucket(UINT64_MAX));
+	CHECK(hist_bucket(UINT64_MAX) == HIST_BUCKETS - 1, "UINT64_MAX -> bucket 31 (got %d)",
+	      hist_bucket(UINT64_MAX));
 }
 
 static void test_bucket_upper_bounds(void)
@@ -146,12 +147,12 @@ static void test_percentiles_uniform(void)
 	uint64_t total = 100;
 
 	/* All percentiles should return bucket 2 upper = 4us = 4000ns */
-	CHECK(percentile_from_hist(hist, total, 1.0) == 4000,
-	      "p1 = 4000 (got %lu)", (unsigned long)percentile_from_hist(hist, total, 1.0));
-	CHECK(percentile_from_hist(hist, total, 50.0) == 4000,
-	      "p50 = 4000 (got %lu)", (unsigned long)percentile_from_hist(hist, total, 50.0));
-	CHECK(percentile_from_hist(hist, total, 99.0) == 4000,
-	      "p99 = 4000 (got %lu)", (unsigned long)percentile_from_hist(hist, total, 99.0));
+	CHECK(percentile_from_hist(hist, total, 1.0) == 4000, "p1 = 4000 (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 1.0));
+	CHECK(percentile_from_hist(hist, total, 50.0) == 4000, "p50 = 4000 (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 50.0));
+	CHECK(percentile_from_hist(hist, total, 99.0) == 4000, "p99 = 4000 (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 99.0));
 }
 
 static void test_percentiles_bimodal(void)
@@ -165,20 +166,20 @@ static void test_percentiles_bimodal(void)
 	uint64_t total = 100;
 
 	/* p1 -> target = ceil(1) = 1 -> bucket 0 -> upper = 1000ns */
-	CHECK(percentile_from_hist(hist, total, 1.0) == 1000,
-	      "p1 = 1000ns (got %lu)", (unsigned long)percentile_from_hist(hist, total, 1.0));
+	CHECK(percentile_from_hist(hist, total, 1.0) == 1000, "p1 = 1000ns (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 1.0));
 
 	/* p50 -> target = ceil(50) = 50 -> cumulative at bucket 0 = 50 >= 50 -> bucket 0 */
-	CHECK(percentile_from_hist(hist, total, 50.0) == 1000,
-	      "p50 = 1000ns (got %lu)", (unsigned long)percentile_from_hist(hist, total, 50.0));
+	CHECK(percentile_from_hist(hist, total, 50.0) == 1000, "p50 = 1000ns (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 50.0));
 
 	/* p51 -> target = ceil(51) = 51 -> need bucket 10 */
-	CHECK(percentile_from_hist(hist, total, 51.0) == 1024000,
-	      "p51 = 1024000ns (got %lu)", (unsigned long)percentile_from_hist(hist, total, 51.0));
+	CHECK(percentile_from_hist(hist, total, 51.0) == 1024000, "p51 = 1024000ns (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 51.0));
 
 	/* p99 -> target = ceil(99) = 99 -> bucket 10 */
-	CHECK(percentile_from_hist(hist, total, 99.0) == 1024000,
-	      "p99 = 1024000ns (got %lu)", (unsigned long)percentile_from_hist(hist, total, 99.0));
+	CHECK(percentile_from_hist(hist, total, 99.0) == 1024000, "p99 = 1024000ns (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 99.0));
 }
 
 static void test_percentiles_spread(void)
@@ -192,12 +193,13 @@ static void test_percentiles_spread(void)
 	uint64_t total = 100;
 
 	/* p10 -> target=10 -> cumulative at bucket 0 = 10 >= 10 -> bucket 0 upper = 1000 */
-	CHECK(percentile_from_hist(hist, total, 10.0) == 1000,
-	      "p10 = 1000ns (got %lu)", (unsigned long)percentile_from_hist(hist, total, 10.0));
+	CHECK(percentile_from_hist(hist, total, 10.0) == 1000, "p10 = 1000ns (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 10.0));
 
-	/* p11 -> target=11 -> cumulative at bucket 0 = 10, bucket 1 = 20 >= 11 -> bucket 1 upper = 2000 */
-	CHECK(percentile_from_hist(hist, total, 11.0) == 2000,
-	      "p11 = 2000ns (got %lu)", (unsigned long)percentile_from_hist(hist, total, 11.0));
+	/* p11 -> target=11 -> cumulative at bucket 0 = 10, bucket 1 = 20 >= 11 -> bucket 1 upper =
+	 * 2000 */
+	CHECK(percentile_from_hist(hist, total, 11.0) == 2000, "p11 = 2000ns (got %lu)",
+	      (unsigned long)percentile_from_hist(hist, total, 11.0));
 
 	/* p50 -> target=50 -> cumulative at bucket 4 = 50 >= 50 -> bucket 4 upper = 16000 */
 	CHECK(percentile_from_hist(hist, total, 50.0) == (NS_PER_US << 4),
@@ -230,8 +232,10 @@ static void test_stats_record_and_hist(void)
 			uint64_t lat = values[v];
 			ios_done++;
 			lat_sum += lat;
-			if (lat < lat_min) lat_min = lat;
-			if (lat > lat_max) lat_max = lat;
+			if (lat < lat_min)
+				lat_min = lat;
+			if (lat > lat_max)
+				lat_max = lat;
 			hist[hist_bucket(lat)]++;
 		}
 	}
@@ -244,7 +248,8 @@ static void test_stats_record_and_hist(void)
 	double expected_avg = (500.0 * 5000 + 300.0 * 50000 + 200.0 * 500000) / 1000.0;
 	CHECK(fabs(avg - expected_avg) < 1.0, "avg = %.1f (expected %.1f)", avg, expected_avg);
 
-	/* 5us -> bucket 3 ([4us,8us)), 50us -> bucket 6 ([32us,64us)), 500us -> bucket 9 ([256us,512us)) */
+	/* 5us -> bucket 3 ([4us,8us)), 50us -> bucket 6 ([32us,64us)), 500us -> bucket 9
+	 * ([256us,512us)) */
 	CHECK(hist[hist_bucket(5000)] == 500, "5us bucket count=500 (got %lu)",
 	      (unsigned long)hist[hist_bucket(5000)]);
 	CHECK(hist[hist_bucket(50000)] == 300, "50us bucket count=300 (got %lu)",

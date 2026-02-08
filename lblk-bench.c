@@ -23,8 +23,8 @@
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 
-#define VERSION "1.0.0"
-#define HIST_BUCKETS 32  /* log2 histogram: bucket i = [2^i, 2^(i+1)) ns; 0 = <1us */
+#define VERSION	     "1.0.0"
+#define HIST_BUCKETS 32 /* log2 histogram: bucket i = [2^i, 2^(i+1)) ns; 0 = <1us */
 #define NS_PER_SEC   1000000000ULL
 #define NS_PER_US    1000ULL
 #define NS_PER_MS    1000000ULL
@@ -185,8 +185,10 @@ static void stats_record(struct worker_stats *s, uint64_t lat_ns, uint64_t bs, b
 		s->read_bytes += bs;
 	}
 	s->lat_sum_ns += lat_ns;
-	if (lat_ns < s->lat_min_ns) s->lat_min_ns = lat_ns;
-	if (lat_ns > s->lat_max_ns) s->lat_max_ns = lat_ns;
+	if (lat_ns < s->lat_min_ns)
+		s->lat_min_ns = lat_ns;
+	if (lat_ns > s->lat_max_ns)
+		s->lat_max_ns = lat_ns;
 	s->hist[hist_bucket(lat_ns)]++;
 }
 
@@ -201,8 +203,10 @@ static void stats_merge(struct worker_stats *dst, const struct worker_stats *src
 	dst->errors += src->errors;
 	dst->flushes += src->flushes;
 	dst->lat_sum_ns += src->lat_sum_ns;
-	if (src->lat_min_ns < dst->lat_min_ns) dst->lat_min_ns = src->lat_min_ns;
-	if (src->lat_max_ns > dst->lat_max_ns) dst->lat_max_ns = src->lat_max_ns;
+	if (src->lat_min_ns < dst->lat_min_ns)
+		dst->lat_min_ns = src->lat_min_ns;
+	if (src->lat_max_ns > dst->lat_max_ns)
+		dst->lat_max_ns = src->lat_max_ns;
 	for (int i = 0; i < HIST_BUCKETS; i++)
 		dst->hist[i] += src->hist[i];
 }
@@ -238,12 +242,13 @@ static uint32_t crc32_compute(const void *data, size_t len)
 
 struct sector_alloc {
 	pthread_mutex_t lock;
-	uint64_t next_offset;  /* next available byte offset */
-	uint64_t limit;        /* upper bound (offset + size) */
-	uint64_t sector_size;  /* typically = bs */
+	uint64_t next_offset; /* next available byte offset */
+	uint64_t limit;	      /* upper bound (offset + size) */
+	uint64_t sector_size; /* typically = bs */
 };
 
-static void sector_alloc_init(struct sector_alloc *sa, uint64_t base, uint64_t size, uint64_t sector_size)
+static void sector_alloc_init(struct sector_alloc *sa, uint64_t base, uint64_t size,
+			      uint64_t sector_size)
 {
 	pthread_mutex_init(&sa->lock, NULL);
 	sa->next_offset = base;
@@ -281,7 +286,7 @@ struct verify_record {
 
 /* ── SPSC ring buffer for verify-pipeline inter-thread handoff ──── */
 
-#define PIPELINE_RING_SIZE 256  /* must be power of 2 */
+#define PIPELINE_RING_SIZE 256 /* must be power of 2 */
 
 struct pipeline_entry {
 	uint64_t offset;
@@ -289,8 +294,8 @@ struct pipeline_entry {
 };
 
 struct pipeline_ring {
-	_Alignas(64) atomic_uint head;  /* written by producer */
-	_Alignas(64) atomic_uint tail;  /* written by consumer */
+	_Alignas(64) atomic_uint head; /* written by producer */
+	_Alignas(64) atomic_uint tail; /* written by consumer */
 	struct pipeline_entry entries[PIPELINE_RING_SIZE];
 };
 
@@ -301,8 +306,7 @@ static void pipeline_ring_init(struct pipeline_ring *r)
 }
 
 /* Push entry; spins if full. Returns false if stop_flag is set. */
-static bool pipeline_ring_push(struct pipeline_ring *r,
-			       const struct pipeline_entry *e,
+static bool pipeline_ring_push(struct pipeline_ring *r, const struct pipeline_entry *e,
 			       const atomic_bool *stop_flag)
 {
 	unsigned h = atomic_load_explicit(&r->head, memory_order_relaxed);
@@ -320,8 +324,7 @@ static bool pipeline_ring_push(struct pipeline_ring *r,
 }
 
 /* Pop entry; spins if empty. Returns false if stop_flag is set and ring empty. */
-static bool pipeline_ring_pop(struct pipeline_ring *r,
-			      struct pipeline_entry *e,
+static bool pipeline_ring_pop(struct pipeline_ring *r, struct pipeline_entry *e,
 			      const atomic_bool *stop_flag)
 {
 	unsigned t = atomic_load_explicit(&r->tail, memory_order_relaxed);
@@ -339,8 +342,7 @@ static bool pipeline_ring_pop(struct pipeline_ring *r,
 }
 
 /* Non-blocking pop: returns true if an entry was available. */
-static bool pipeline_ring_try_pop(struct pipeline_ring *r,
-				  struct pipeline_entry *e)
+static bool pipeline_ring_try_pop(struct pipeline_ring *r, struct pipeline_entry *e)
 {
 	unsigned t = atomic_load_explicit(&r->tail, memory_order_relaxed);
 	unsigned h = atomic_load_explicit(&r->head, memory_order_acquire);
@@ -355,8 +357,8 @@ static bool pipeline_ring_try_pop(struct pipeline_ring *r,
 
 struct pipeline_ctx {
 	struct sector_alloc *alloc;
-	struct pipeline_ring *rings;  /* array of numjobs rings */
-	atomic_bool stop_flag;        /* set when runtime expires */
+	struct pipeline_ring *rings; /* array of numjobs rings */
+	atomic_bool stop_flag;	     /* set when runtime expires */
 	int numjobs;
 };
 
@@ -366,8 +368,7 @@ struct pipeline_ctx {
  * Helper: drain exactly n_ios completions from the queue.
  * Returns number of I/O errors.
  */
-static int do_io_drain(struct blkioq *q, struct blkio_completion *comps,
-		       int max_comps, int n_ios)
+static int do_io_drain(struct blkioq *q, struct blkio_completion *comps, int max_comps, int n_ios)
 {
 	int errs = 0;
 	int outstanding = n_ios;
@@ -443,14 +444,13 @@ static void *verify_flush_thread(void *arg)
 			recs = realloc(recs, rec_cap * sizeof(*recs));
 		}
 		recs[rec_count++] = (struct verify_record){
-			.offset = off,
-			.n_sectors = (uint32_t)n_sec,
-			.crc = crc,
+		    .offset = off,
+		    .n_sectors = (uint32_t)n_sec,
+		    .crc = crc,
 		};
 
 		for (int s = 0; s < n_sec; s++)
-			blkioq_write(q, off + (uint64_t)s * bs,
-				     buf + (size_t)s * bs, bs, NULL, 0);
+			blkioq_write(q, off + (uint64_t)s * bs, buf + (size_t)s * bs, bs, NULL, 0);
 
 		int errs = do_io_drain(q, comps, max_comps, n_sec);
 		if (errs) {
@@ -486,8 +486,8 @@ static void *verify_flush_thread(void *arg)
 		unsigned char *buf = base;
 
 		for (uint32_t s = 0; s < rec->n_sectors; s++)
-			blkioq_read(q, rec->offset + (uint64_t)s * bs,
-				    buf + (size_t)s * bs, bs, NULL, 0);
+			blkioq_read(q, rec->offset + (uint64_t)s * bs, buf + (size_t)s * bs, bs,
+				    NULL, 0);
 
 		int errs = do_io_drain(q, comps, max_comps, (int)rec->n_sectors);
 		if (errs) {
@@ -506,21 +506,22 @@ static void *verify_flush_thread(void *arg)
 
 		uint32_t actual_crc = crc32_compute(buf, total_bytes);
 		if (actual_crc != rec->crc) {
-			fprintf(stderr, "VERIFY FAIL: job %d, offset %lu, %u sectors: "
+			fprintf(stderr,
+				"VERIFY FAIL: job %d, offset %lu, %u sectors: "
 				"expected crc 0x%08x, got 0x%08x\n",
-				w->job_index, (unsigned long)rec->offset,
-				rec->n_sectors, rec->crc, actual_crc);
+				w->job_index, (unsigned long)rec->offset, rec->n_sectors, rec->crc,
+				actual_crc);
 			mismatches++;
 			w->stats.errors++;
 		}
 	}
 
 	if (mismatches == 0)
-		printf("verify job %d: OK - %zu regions (%d writes) verified\n",
-		       w->job_index, rec_count, total_writes);
+		printf("verify job %d: OK - %zu regions (%d writes) verified\n", w->job_index,
+		       rec_count, total_writes);
 	else
-		printf("verify job %d: FAILED - %d/%zu regions mismatched\n",
-		       w->job_index, mismatches, rec_count);
+		printf("verify job %d: FAILED - %d/%zu regions mismatched\n", w->job_index,
+		       mismatches, rec_count);
 
 	free(recs);
 	free(comps);
@@ -585,7 +586,7 @@ static void *verify_pipeline_thread(void *arg)
 		w->stats.bytes_done += bs;
 
 		/* Step 2: Send (offset, crc) to next thread's ring */
-		struct pipeline_entry e = { .offset = off, .crc = crc };
+		struct pipeline_entry e = {.offset = off, .crc = crc};
 		if (nj > 1) {
 			if (!pipeline_ring_push(send_ring, &e, &pctx->stop_flag))
 				break;
@@ -623,10 +624,10 @@ static void *verify_pipeline_thread(void *arg)
 
 		uint32_t actual_crc = crc32_compute(rbuf, bs);
 		if (actual_crc != recv.crc) {
-			fprintf(stderr, "VERIFY FAIL: job %d, offset %lu: "
+			fprintf(stderr,
+				"VERIFY FAIL: job %d, offset %lu: "
 				"expected crc 0x%08x, got 0x%08x\n",
-				me, (unsigned long)recv.offset,
-				recv.crc, actual_crc);
+				me, (unsigned long)recv.offset, recv.crc, actual_crc);
 			mismatches++;
 			w->stats.errors++;
 		}
@@ -653,10 +654,10 @@ static void *verify_pipeline_thread(void *arg)
 
 			uint32_t actual_crc = crc32_compute(rbuf, bs);
 			if (actual_crc != recv.crc) {
-				fprintf(stderr, "VERIFY FAIL: job %d, offset %lu: "
+				fprintf(stderr,
+					"VERIFY FAIL: job %d, offset %lu: "
 					"expected crc 0x%08x, got 0x%08x\n",
-					me, (unsigned long)recv.offset,
-					recv.crc, actual_crc);
+					me, (unsigned long)recv.offset, recv.crc, actual_crc);
 				mismatches++;
 				w->stats.errors++;
 			}
@@ -665,11 +666,11 @@ static void *verify_pipeline_thread(void *arg)
 	}
 
 	if (mismatches == 0)
-		printf("pipeline job %d: OK - %lu writes, %lu verifies\n",
-		       me, (unsigned long)total_writes, (unsigned long)total_verifies);
+		printf("pipeline job %d: OK - %lu writes, %lu verifies\n", me,
+		       (unsigned long)total_writes, (unsigned long)total_verifies);
 	else
-		printf("pipeline job %d: FAILED - %lu mismatches in %lu verifies\n",
-		       me, (unsigned long)mismatches, (unsigned long)total_verifies);
+		printf("pipeline job %d: FAILED - %lu mismatches in %lu verifies\n", me,
+		       (unsigned long)mismatches, (unsigned long)total_verifies);
 
 	return NULL;
 }
@@ -697,7 +698,8 @@ static uint64_t next_offset(struct worker_ctx *w)
 	uint64_t io_range = a->size;
 	uint64_t n_blocks = io_range / a->bs;
 
-	if (n_blocks == 0) n_blocks = 1;
+	if (n_blocks == 0)
+		n_blocks = 1;
 
 	if (mode_is_random(a->rw)) {
 		uint64_t block = xorshift64(&w->prng_state) % n_blocks;
@@ -784,7 +786,8 @@ static void *worker_thread(void *arg)
 			/* drain: don't requeue, just process completions */
 			for (int i = 0; i < n; i++) {
 				struct req_slot *s = comps[i].user_data;
-				if (!s) continue; /* flush completion */
+				if (!s)
+					continue; /* flush completion */
 				if (comps[i].ret != 0) {
 					w->stats.errors++;
 					continue;
@@ -797,7 +800,8 @@ static void *worker_thread(void *arg)
 
 		for (int i = 0; i < n; i++) {
 			struct req_slot *s = comps[i].user_data;
-			if (!s) continue; /* flush completion */
+			if (!s)
+				continue; /* flush completion */
 			if (comps[i].ret != 0) {
 				w->stats.errors++;
 				/* still re-queue to maintain depth */
@@ -848,9 +852,9 @@ static void read_cpu_usage(struct cpu_usage *c)
 	/* Fields: pid comm state ppid ... field14=utime field15=stime */
 	unsigned long utime = 0, stime = 0;
 	int scanned = fscanf(f,
-		"%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u "
-		"%*u %*u %*u %lu %lu",
-		&utime, &stime);
+			     "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u "
+			     "%*u %*u %*u %lu %lu",
+			     &utime, &stime);
 	fclose(f);
 	if (scanned == 2) {
 		c->utime_ticks = utime;
@@ -869,12 +873,30 @@ static int parse_size(const char *str, uint64_t *out)
 		return -1;
 	uint64_t mult = 1;
 	switch (*end) {
-	case 'k': case 'K': mult = 1024; end++; break;
-	case 'm': case 'M': mult = 1024 * 1024; end++; break;
-	case 'g': case 'G': mult = 1024ULL * 1024 * 1024; end++; break;
-	case 't': case 'T': mult = 1024ULL * 1024 * 1024 * 1024; end++; break;
-	case '\0': break;
-	default: return -1;
+	case 'k':
+	case 'K':
+		mult = 1024;
+		end++;
+		break;
+	case 'm':
+	case 'M':
+		mult = 1024 * 1024;
+		end++;
+		break;
+	case 'g':
+	case 'G':
+		mult = 1024ULL * 1024 * 1024;
+		end++;
+		break;
+	case 't':
+	case 'T':
+		mult = 1024ULL * 1024 * 1024 * 1024;
+		end++;
+		break;
+	case '\0':
+		break;
+	default:
+		return -1;
 	}
 	if (*end != '\0')
 		return -1;
@@ -884,14 +906,22 @@ static int parse_size(const char *str, uint64_t *out)
 
 static enum rw_mode parse_rw(const char *str)
 {
-	if (!strcmp(str, "read")) return RW_READ;
-	if (!strcmp(str, "write")) return RW_WRITE;
-	if (!strcmp(str, "randread")) return RW_RANDREAD;
-	if (!strcmp(str, "randwrite")) return RW_RANDWRITE;
-	if (!strcmp(str, "readwrite") || !strcmp(str, "rw")) return RW_READWRITE;
-	if (!strcmp(str, "randrw")) return RW_RANDRW;
-	if (!strcmp(str, "verify-flush")) return RW_VERIFY_FLUSH;
-	if (!strcmp(str, "verify-pipeline")) return RW_VERIFY_PIPELINE;
+	if (!strcmp(str, "read"))
+		return RW_READ;
+	if (!strcmp(str, "write"))
+		return RW_WRITE;
+	if (!strcmp(str, "randread"))
+		return RW_RANDREAD;
+	if (!strcmp(str, "randwrite"))
+		return RW_RANDWRITE;
+	if (!strcmp(str, "readwrite") || !strcmp(str, "rw"))
+		return RW_READWRITE;
+	if (!strcmp(str, "randrw"))
+		return RW_RANDRW;
+	if (!strcmp(str, "verify-flush"))
+		return RW_VERIFY_FLUSH;
+	if (!strcmp(str, "verify-pipeline"))
+		return RW_VERIFY_PIPELINE;
 	fprintf(stderr, "error: unknown --rw mode '%s'\n", str);
 	exit(1);
 }
@@ -899,14 +929,22 @@ static enum rw_mode parse_rw(const char *str)
 static const char *rw_name(enum rw_mode m)
 {
 	switch (m) {
-	case RW_READ:      return "read";
-	case RW_WRITE:     return "write";
-	case RW_RANDREAD:  return "randread";
-	case RW_RANDWRITE: return "randwrite";
-	case RW_READWRITE: return "readwrite";
-	case RW_RANDRW:        return "randrw";
-	case RW_VERIFY_FLUSH:     return "verify-flush";
-	case RW_VERIFY_PIPELINE:  return "verify-pipeline";
+	case RW_READ:
+		return "read";
+	case RW_WRITE:
+		return "write";
+	case RW_RANDREAD:
+		return "randread";
+	case RW_RANDWRITE:
+		return "randwrite";
+	case RW_READWRITE:
+		return "readwrite";
+	case RW_RANDRW:
+		return "randrw";
+	case RW_VERIFY_FLUSH:
+		return "verify-flush";
+	case RW_VERIFY_PIPELINE:
+		return "verify-pipeline";
 	}
 	return "unknown";
 }
@@ -937,9 +975,8 @@ static void format_iops(double iops, char *buf, size_t len)
 		snprintf(buf, len, "%.0f", iops);
 }
 
-static void print_human_output(struct bench_args *a, struct worker_stats *total,
-			       double wall_sec, struct cpu_usage *cpu_before,
-			       struct cpu_usage *cpu_after)
+static void print_human_output(struct bench_args *a, struct worker_stats *total, double wall_sec,
+			       struct cpu_usage *cpu_before, struct cpu_usage *cpu_after)
 {
 	double iops = (double)total->ios_done / wall_sec;
 	double bw_bytes = (double)total->bytes_done / wall_sec;
@@ -951,15 +988,14 @@ static void print_human_output(struct bench_args *a, struct worker_stats *total,
 
 	char bs_str[32];
 	format_size(a->bs, bs_str, sizeof(bs_str));
-	printf("lblk-bench: rw=%s, bs=%s, iodepth=%d, numjobs=%d, runtime=%ds\n",
-	       rw_name(a->rw), bs_str, a->iodepth, a->numjobs, a->runtime);
+	printf("lblk-bench: rw=%s, bs=%s, iodepth=%d, numjobs=%d, runtime=%ds\n", rw_name(a->rw),
+	       bs_str, a->iodepth, a->numjobs, a->runtime);
 
 	/* Determine latency display unit based on p50 (like fio) */
 	const char *lat_unit;
 	double lat_div;
-	uint64_t p50_ns = total->ios_done > 0
-		? percentile_from_hist(total->hist, total->ios_done, 50.0)
-		: 0;
+	uint64_t p50_ns =
+	    total->ios_done > 0 ? percentile_from_hist(total->hist, total->ios_done, 50.0) : 0;
 	if (p50_ns < NS_PER_US) {
 		lat_unit = "nsec";
 		lat_div = 1.0;
@@ -983,14 +1019,13 @@ static void print_human_output(struct bench_args *a, struct worker_stats *total,
 		char r_iops_str[32], w_iops_str[32];
 		format_iops(r_iops, r_iops_str, sizeof(r_iops_str));
 		format_iops(w_iops, w_iops_str, sizeof(w_iops_str));
-		printf("  read:  IOPS=%s, BW=%.0fMiB/s (%.0fMB/s)\n",
-		       r_iops_str, r_bw / (1024.0 * 1024.0), r_bw / 1e6);
-		printf("  write: IOPS=%s, BW=%.0fMiB/s (%.0fMB/s)\n",
-		       w_iops_str, w_bw / (1024.0 * 1024.0), w_bw / 1e6);
+		printf("  read:  IOPS=%s, BW=%.0fMiB/s (%.0fMB/s)\n", r_iops_str,
+		       r_bw / (1024.0 * 1024.0), r_bw / 1e6);
+		printf("  write: IOPS=%s, BW=%.0fMiB/s (%.0fMB/s)\n", w_iops_str,
+		       w_bw / (1024.0 * 1024.0), w_bw / 1e6);
 	} else {
 		const char *dir = has_write ? "write" : "read";
-		printf("  %s: IOPS=%s, BW=%.0fMiB/s (%.0fMB/s)\n",
-		       dir, iops_str, bw_mib, bw_mb);
+		printf("  %s: IOPS=%s, BW=%.0fMiB/s (%.0fMB/s)\n", dir, iops_str, bw_mib, bw_mb);
 	}
 
 	if (total->ios_done > 0) {
@@ -998,8 +1033,8 @@ static void print_human_output(struct bench_args *a, struct worker_stats *total,
 		double min_lat = (double)total->lat_min_ns / lat_div;
 		double max_lat = (double)total->lat_max_ns / lat_div;
 
-		printf("    lat (%s): min=%.1f, max=%.1f, avg=%.1f\n",
-		       lat_unit, min_lat, max_lat, avg_lat);
+		printf("    lat (%s): min=%.1f, max=%.1f, avg=%.1f\n", lat_unit, min_lat, max_lat,
+		       avg_lat);
 
 		static const double pcts[] = {1, 5, 10, 50, 90, 99, 99.9, 99.99};
 		static const int row_start[] = {0, 3, 6};
@@ -1008,7 +1043,8 @@ static void print_human_output(struct bench_args *a, struct worker_stats *total,
 		for (int r = 0; r < 3; r++) {
 			printf("     |");
 			for (int j = row_start[r]; j < row_start[r] + row_len[r]; j++) {
-				uint64_t val_ns = percentile_from_hist(total->hist, total->ios_done, pcts[j]);
+				uint64_t val_ns =
+				    percentile_from_hist(total->hist, total->ios_done, pcts[j]);
 				long val = (long)(val_ns / (uint64_t)lat_div);
 				if (j == 7)
 					printf(" %5.2fth=[%5ld]", pcts[j], val);
@@ -1022,24 +1058,24 @@ static void print_human_output(struct bench_args *a, struct worker_stats *total,
 	/* CPU usage */
 	long ticks_per_sec = sysconf(_SC_CLK_TCK);
 	if (ticks_per_sec > 0) {
-		double wall_s = (double)(cpu_after->wall_ns - cpu_before->wall_ns) / (double)NS_PER_SEC;
-		double usr = (double)(cpu_after->utime_ticks - cpu_before->utime_ticks) / (double)ticks_per_sec;
-		double sys = (double)(cpu_after->stime_ticks - cpu_before->stime_ticks) / (double)ticks_per_sec;
+		double wall_s =
+		    (double)(cpu_after->wall_ns - cpu_before->wall_ns) / (double)NS_PER_SEC;
+		double usr = (double)(cpu_after->utime_ticks - cpu_before->utime_ticks) /
+			     (double)ticks_per_sec;
+		double sys = (double)(cpu_after->stime_ticks - cpu_before->stime_ticks) /
+			     (double)ticks_per_sec;
 		if (wall_s > 0) {
-			printf("  cpu: usr=%.1f%%, sys=%.1f%%\n",
-			       usr / wall_s * 100.0, sys / wall_s * 100.0);
+			printf("  cpu: usr=%.1f%%, sys=%.1f%%\n", usr / wall_s * 100.0,
+			       sys / wall_s * 100.0);
 		}
 	}
 
-	printf("  ios: total=%lu, errors=%lu, flushes=%lu\n",
-	       (unsigned long)total->ios_done,
-	       (unsigned long)total->errors,
-	       (unsigned long)total->flushes);
+	printf("  ios: total=%lu, errors=%lu, flushes=%lu\n", (unsigned long)total->ios_done,
+	       (unsigned long)total->errors, (unsigned long)total->flushes);
 }
 
-static void print_json_output(struct bench_args *a, struct worker_stats *total,
-			      double wall_sec, struct cpu_usage *cpu_before,
-			      struct cpu_usage *cpu_after)
+static void print_json_output(struct bench_args *a, struct worker_stats *total, double wall_sec,
+			      struct cpu_usage *cpu_before, struct cpu_usage *cpu_after)
 {
 	double iops = (double)total->ios_done / wall_sec;
 	double bw_bytes = (double)total->bytes_done / wall_sec;
@@ -1070,13 +1106,14 @@ static void print_json_output(struct bench_args *a, struct worker_stats *total,
 	if (total->ios_done > 0) {
 		printf("    \"min\": %lu,\n", (unsigned long)total->lat_min_ns);
 		printf("    \"max\": %lu,\n", (unsigned long)total->lat_max_ns);
-		printf("    \"mean\": %.0f,\n", (double)total->lat_sum_ns / (double)total->ios_done);
+		printf("    \"mean\": %.0f,\n",
+		       (double)total->lat_sum_ns / (double)total->ios_done);
 		printf("    \"percentiles\": {\n");
 		static const double pcts[] = {1, 5, 10, 50, 90, 99, 99.9, 99.99};
 		for (int i = 0; i < 8; i++) {
 			uint64_t val = percentile_from_hist(total->hist, total->ios_done, pcts[i]);
-			printf("      \"p%.2f\": %lu%s\n",
-			       pcts[i], (unsigned long)val, i < 7 ? "," : "");
+			printf("      \"p%.2f\": %lu%s\n", pcts[i], (unsigned long)val,
+			       i < 7 ? "," : "");
 		}
 		printf("    }\n");
 	} else {
@@ -1090,8 +1127,10 @@ static void print_json_output(struct bench_args *a, struct worker_stats *total,
 	double wall_s = (double)(cpu_after->wall_ns - cpu_before->wall_ns) / (double)NS_PER_SEC;
 	double usr_pct = 0, sys_pct = 0;
 	if (ticks_per_sec > 0 && wall_s > 0) {
-		usr_pct = (double)(cpu_after->utime_ticks - cpu_before->utime_ticks) / (double)ticks_per_sec / wall_s * 100.0;
-		sys_pct = (double)(cpu_after->stime_ticks - cpu_before->stime_ticks) / (double)ticks_per_sec / wall_s * 100.0;
+		usr_pct = (double)(cpu_after->utime_ticks - cpu_before->utime_ticks) /
+			  (double)ticks_per_sec / wall_s * 100.0;
+		sys_pct = (double)(cpu_after->stime_ticks - cpu_before->stime_ticks) /
+			  (double)ticks_per_sec / wall_s * 100.0;
 	}
 	printf("  \"cpu\": { \"usr\": %.2f, \"sys\": %.2f }\n", usr_pct, sys_pct);
 	printf("}\n");
@@ -1102,37 +1141,36 @@ static void print_json_output(struct bench_args *a, struct worker_stats *total,
 static void usage(void)
 {
 	fprintf(stderr,
-"Usage: lblk-bench --path PATH --rw MODE [options]\n"
-"\n"
-"Required:\n"
-"  --path PATH           Device/socket path (meaning depends on --driver)\n"
-"  --rw MODE             I/O pattern: read, write, randread, randwrite,\n"
-"                        readwrite, randrw, verify-flush, verify-pipeline\n"
-"\n"
-"Workload options:\n"
-"  --bs SIZE             Block size (default: 4k)\n"
-"  --iodepth N           Outstanding I/Os per queue (default: 1)\n"
-"  --numjobs N           Parallel jobs/queues (default: 1)\n"
-"  --runtime SEC         Duration in seconds (default: 10)\n"
-"  --size SIZE           I/O region size per job (default: device capacity)\n"
-"  --offset SIZE         Starting offset for I/O (default: 0)\n"
-"  --rwmixread PCT       Read percentage for mixed workloads (default: 50)\n"
-"  --ramp_time SEC       Warmup seconds before measuring (default: 0)\n"
-"  --sync N              Flush every N writes; 0=disabled (default: 0)\n"
-"\n"
-"Verify options (for --rw verify-flush):\n"
-"  --verify-sectors M:N  Sectors per write region (default: 1:16)\n"
-"\n"
-"libblkio options:\n"
-"  --driver NAME         libblkio driver (default: virtio-blk-vhost-user)\n"
-"  --queue-size N        Virtio queue size (default: 256)\n"
-"\n"
-"Output options:\n"
-"  --output-format FMT   Output format: normal, json (default: normal)\n"
-"\n"
-"  --help                Show this help\n"
-"  --version             Show version\n"
-	);
+		"Usage: lblk-bench --path PATH --rw MODE [options]\n"
+		"\n"
+		"Required:\n"
+		"  --path PATH           Device/socket path (meaning depends on --driver)\n"
+		"  --rw MODE             I/O pattern: read, write, randread, randwrite,\n"
+		"                        readwrite, randrw, verify-flush, verify-pipeline\n"
+		"\n"
+		"Workload options:\n"
+		"  --bs SIZE             Block size (default: 4k)\n"
+		"  --iodepth N           Outstanding I/Os per queue (default: 1)\n"
+		"  --numjobs N           Parallel jobs/queues (default: 1)\n"
+		"  --runtime SEC         Duration in seconds (default: 10)\n"
+		"  --size SIZE           I/O region size per job (default: device capacity)\n"
+		"  --offset SIZE         Starting offset for I/O (default: 0)\n"
+		"  --rwmixread PCT       Read percentage for mixed workloads (default: 50)\n"
+		"  --ramp_time SEC       Warmup seconds before measuring (default: 0)\n"
+		"  --sync N              Flush every N writes; 0=disabled (default: 0)\n"
+		"\n"
+		"Verify options (for --rw verify-flush):\n"
+		"  --verify-sectors M:N  Sectors per write region (default: 1:16)\n"
+		"\n"
+		"libblkio options:\n"
+		"  --driver NAME         libblkio driver (default: virtio-blk-vhost-user)\n"
+		"  --queue-size N        Virtio queue size (default: 256)\n"
+		"\n"
+		"Output options:\n"
+		"  --output-format FMT   Output format: normal, json (default: normal)\n"
+		"\n"
+		"  --help                Show this help\n"
+		"  --version             Show version\n");
 }
 
 /* ── Main ──────────────────────────────────────────────────────────── */
@@ -1140,62 +1178,73 @@ static void usage(void)
 int main(int argc, char **argv)
 {
 	struct bench_args args = {
-		.path = NULL,
-		.driver = "virtio-blk-vhost-user",
-		.rw = RW_READ,
-		.bs = 4096,
-		.iodepth = 1,
-		.numjobs = 1,
-		.runtime = 10,
-		.size = 0,
-		.offset = 0,
-		.rwmixread = 50,
-		.ramp_time = 0,
-		.sync_n = 0,
-		.queue_size = 256,
-		.json_output = false,
-		.verify_min_sectors = 1,
-		.verify_max_sectors = 16,
-		.verify_inject_fault = false,
+	    .path = NULL,
+	    .driver = "virtio-blk-vhost-user",
+	    .rw = RW_READ,
+	    .bs = 4096,
+	    .iodepth = 1,
+	    .numjobs = 1,
+	    .runtime = 10,
+	    .size = 0,
+	    .offset = 0,
+	    .rwmixread = 50,
+	    .ramp_time = 0,
+	    .sync_n = 0,
+	    .queue_size = 256,
+	    .json_output = false,
+	    .verify_min_sectors = 1,
+	    .verify_max_sectors = 16,
+	    .verify_inject_fault = false,
 	};
 	bool rw_set = false;
 
 	static struct option long_options[] = {
-		{"path",          required_argument, 0, 'p'},
-		{"rw",            required_argument, 0, 'r'},
-		{"bs",            required_argument, 0, 'b'},
-		{"iodepth",       required_argument, 0, 'd'},
-		{"numjobs",       required_argument, 0, 'j'},
-		{"runtime",       required_argument, 0, 't'},
-		{"size",          required_argument, 0, 's'},
-		{"offset",        required_argument, 0, 'o'},
-		{"rwmixread",     required_argument, 0, 'm'},
-		{"ramp_time",     required_argument, 0, 'R'},
-		{"sync",          required_argument, 0, 'S'},
-		{"driver",        required_argument, 0, 'D'},
-		{"queue-size",    required_argument, 0, 'Q'},
-		{"output-format",   required_argument, 0, 'F'},
-		{"verify-sectors",       required_argument, 0, 'E'},
-		{"verify-inject-fault",  no_argument,       0, 'I'},
-		{"help",            no_argument,       0, 'h'},
-		{"version",         no_argument,       0, 'V'},
-		{0, 0, 0, 0},
+	    {"path", required_argument, 0, 'p'},
+	    {"rw", required_argument, 0, 'r'},
+	    {"bs", required_argument, 0, 'b'},
+	    {"iodepth", required_argument, 0, 'd'},
+	    {"numjobs", required_argument, 0, 'j'},
+	    {"runtime", required_argument, 0, 't'},
+	    {"size", required_argument, 0, 's'},
+	    {"offset", required_argument, 0, 'o'},
+	    {"rwmixread", required_argument, 0, 'm'},
+	    {"ramp_time", required_argument, 0, 'R'},
+	    {"sync", required_argument, 0, 'S'},
+	    {"driver", required_argument, 0, 'D'},
+	    {"queue-size", required_argument, 0, 'Q'},
+	    {"output-format", required_argument, 0, 'F'},
+	    {"verify-sectors", required_argument, 0, 'E'},
+	    {"verify-inject-fault", no_argument, 0, 'I'},
+	    {"help", no_argument, 0, 'h'},
+	    {"version", no_argument, 0, 'V'},
+	    {0, 0, 0, 0},
 	};
 
 	int opt;
 	while ((opt = getopt_long(argc, argv, "", long_options, NULL)) != -1) {
 		switch (opt) {
-		case 'p': args.path = optarg; break;
-		case 'r': args.rw = parse_rw(optarg); rw_set = true; break;
+		case 'p':
+			args.path = optarg;
+			break;
+		case 'r':
+			args.rw = parse_rw(optarg);
+			rw_set = true;
+			break;
 		case 'b':
 			if (parse_size(optarg, &args.bs) < 0) {
 				fprintf(stderr, "error: invalid --bs '%s'\n", optarg);
 				return 1;
 			}
 			break;
-		case 'd': args.iodepth = atoi(optarg); break;
-		case 'j': args.numjobs = atoi(optarg); break;
-		case 't': args.runtime = atoi(optarg); break;
+		case 'd':
+			args.iodepth = atoi(optarg);
+			break;
+		case 'j':
+			args.numjobs = atoi(optarg);
+			break;
+		case 't':
+			args.runtime = atoi(optarg);
+			break;
 		case 's':
 			if (parse_size(optarg, &args.size) < 0) {
 				fprintf(stderr, "error: invalid --size '%s'\n", optarg);
@@ -1208,11 +1257,21 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
-		case 'm': args.rwmixread = atoi(optarg); break;
-		case 'R': args.ramp_time = atoi(optarg); break;
-		case 'S': args.sync_n = atoi(optarg); break;
-		case 'D': args.driver = optarg; break;
-		case 'Q': args.queue_size = atoi(optarg); break;
+		case 'm':
+			args.rwmixread = atoi(optarg);
+			break;
+		case 'R':
+			args.ramp_time = atoi(optarg);
+			break;
+		case 'S':
+			args.sync_n = atoi(optarg);
+			break;
+		case 'D':
+			args.driver = optarg;
+			break;
+		case 'Q':
+			args.queue_size = atoi(optarg);
+			break;
 		case 'F':
 			if (!strcmp(optarg, "json"))
 				args.json_output = true;
@@ -1230,16 +1289,25 @@ int main(int argc, char **argv)
 			}
 			args.verify_min_sectors = atoi(optarg);
 			args.verify_max_sectors = atoi(colon + 1);
-			if (args.verify_min_sectors < 1 || args.verify_max_sectors < args.verify_min_sectors) {
+			if (args.verify_min_sectors < 1 ||
+			    args.verify_max_sectors < args.verify_min_sectors) {
 				fprintf(stderr, "error: --verify-sectors: need 1 <= MIN <= MAX\n");
 				return 1;
 			}
 			break;
 		}
-		case 'I': args.verify_inject_fault = true; break;
-		case 'h': usage(); return 0;
-		case 'V': printf("lblk-bench %s\n", VERSION); return 0;
-		default: usage(); return 1;
+		case 'I':
+			args.verify_inject_fault = true;
+			break;
+		case 'h':
+			usage();
+			return 0;
+		case 'V':
+			printf("lblk-bench %s\n", VERSION);
+			return 0;
+		default:
+			usage();
+			return 1;
 		}
 	}
 
@@ -1283,23 +1351,21 @@ int main(int argc, char **argv)
 
 	ret = blkio_create(args.driver, &b);
 	if (ret < 0) {
-		fprintf(stderr, "error: blkio_create(%s): %s\n",
-			args.driver, blkio_get_error_msg());
+		fprintf(stderr, "error: blkio_create(%s): %s\n", args.driver,
+			blkio_get_error_msg());
 		return 1;
 	}
 
 	ret = blkio_set_str(b, "path", args.path);
 	if (ret < 0) {
-		fprintf(stderr, "error: blkio_set_str(path): %s\n",
-			blkio_get_error_msg());
+		fprintf(stderr, "error: blkio_set_str(path): %s\n", blkio_get_error_msg());
 		blkio_destroy(&b);
 		return 1;
 	}
 
 	ret = blkio_connect(b);
 	if (ret < 0) {
-		fprintf(stderr, "error: blkio_connect: %s\n",
-			blkio_get_error_msg());
+		fprintf(stderr, "error: blkio_connect: %s\n", blkio_get_error_msg());
 		blkio_destroy(&b);
 		return 1;
 	}
@@ -1322,8 +1388,7 @@ int main(int argc, char **argv)
 
 	ret = blkio_start(b);
 	if (ret < 0) {
-		fprintf(stderr, "error: blkio_start: %s\n",
-			blkio_get_error_msg());
+		fprintf(stderr, "error: blkio_start: %s\n", blkio_get_error_msg());
 		blkio_destroy(&b);
 		return 1;
 	}
@@ -1385,8 +1450,8 @@ int main(int argc, char **argv)
 
 		ret = blkio_alloc_mem_region(b, &workers[i].region, region_size);
 		if (ret < 0) {
-			fprintf(stderr, "error: blkio_alloc_mem_region (job %d): %s\n",
-				i, blkio_get_error_msg());
+			fprintf(stderr, "error: blkio_alloc_mem_region (job %d): %s\n", i,
+				blkio_get_error_msg());
 			/* cleanup already allocated regions */
 			for (int j = 0; j < i; j++) {
 				blkio_unmap_mem_region(b, &workers[j].region);
@@ -1400,8 +1465,8 @@ int main(int argc, char **argv)
 
 		ret = blkio_map_mem_region(b, &workers[i].region);
 		if (ret < 0) {
-			fprintf(stderr, "error: blkio_map_mem_region (job %d): %s\n",
-				i, blkio_get_error_msg());
+			fprintf(stderr, "error: blkio_map_mem_region (job %d): %s\n", i,
+				blkio_get_error_msg());
 			blkio_free_mem_region(b, &workers[i].region);
 			for (int j = 0; j < i; j++) {
 				blkio_unmap_mem_region(b, &workers[j].region);
@@ -1431,14 +1496,13 @@ int main(int argc, char **argv)
 	struct cpu_usage cpu_before, cpu_after;
 	read_cpu_usage(&cpu_before);
 
-	void *(*thread_fn)(void *) = is_verify_flush ? verify_flush_thread
-				   : is_verify_pipeline ? verify_pipeline_thread
-				   : worker_thread;
+	void *(*thread_fn)(void *) = is_verify_flush	  ? verify_flush_thread
+				     : is_verify_pipeline ? verify_pipeline_thread
+							  : worker_thread;
 	for (int i = 0; i < args.numjobs; i++) {
 		ret = pthread_create(&threads[i], NULL, thread_fn, &workers[i]);
 		if (ret) {
-			fprintf(stderr, "error: pthread_create (job %d): %s\n",
-				i, strerror(ret));
+			fprintf(stderr, "error: pthread_create (job %d): %s\n", i, strerror(ret));
 			/* signal already-running threads to stop by adjusting end_ns */
 			uint64_t t = now_ns();
 			for (int j = 0; j < i; j++) {

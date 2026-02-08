@@ -1,6 +1,7 @@
 lblk-bench
 poc
 test_hist
+test_funcs
 *.o
 *.raw
 *.swp

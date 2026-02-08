@@ -10,6 +10,12 @@ Prerequisites: libblkio (installed with pkg-config support), GCC, pthreads.
 make
 ```
 
+Run unit tests:
+
+```bash
+make test
+```
+
 ## Quick Start
 
 ### vhost-user-blk (with ubiblk)
@@ -24,11 +30,17 @@ Run benchmark:
 ./lblk-bench --path /tmp/vhost.sock --rw randread --bs 4k --iodepth 32 --numjobs 4 --runtime 10
 ```
 
-### io-uring (local file baseline)
+### io_uring (local file baseline)
 
 ```bash
 truncate -s 1G /tmp/test-disk.raw
-./lblk-bench --driver io-uring --path /tmp/test-disk.raw --rw randread --bs 4k --iodepth 32
+./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw randread --bs 4k --iodepth 32
+```
+
+### JSON output
+
+```bash
+./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw randread --output-format json | jq .
 ```
 
 ## CLI Reference
@@ -38,13 +50,13 @@ truncate -s 1G /tmp/test-disk.raw
 | Arg | Description |
 |-----|-------------|
 | `--path PATH` | Device/socket path (meaning depends on `--driver`) |
-| `--rw MODE` | I/O pattern: `read`, `write`, `randread`, `randwrite`, `readwrite`, `randrw` |
+| `--rw MODE` | I/O pattern: `read`, `write`, `randread`, `randwrite`, `readwrite`, `randrw`, `verify-flush`, `verify-pipeline` |
 
 ### Workload Options
 
 | Arg | Default | Description |
 |-----|---------|-------------|
-| `--bs SIZE` | `4k` | Block size (supports k/m/g suffixes) |
+| `--bs SIZE` | `4k` | Block size (supports k/m/g suffixes, must be power of 2, >= 512) |
 | `--iodepth N` | `1` | Outstanding I/Os per queue |
 | `--numjobs N` | `1` | Parallel jobs (each gets its own queue and thread) |
 | `--runtime SEC` | `10` | Duration in seconds |
@@ -54,11 +66,20 @@ truncate -s 1G /tmp/test-disk.raw
 | `--ramp_time SEC` | `0` | Warmup seconds; stats reset after ramp |
 | `--sync N` | `0` | Flush every N writes; 0 = disabled |
 
+### Verify Options
+
+Used with `--rw verify-flush` and `--rw verify-pipeline` modes.
+
+| Arg | Default | Description |
+|-----|---------|-------------|
+| `--verify-sectors MIN:MAX` | `1:16` | Sectors per write region (range, inclusive) |
+| `--verify-inject-fault` | off | Inject a single-byte corruption per thread to test fault detection |
+
 ### libblkio Options
 
 | Arg | Default | Description |
 |-----|---------|-------------|
-| `--driver NAME` | `virtio-blk-vhost-user` | libblkio driver name |
+| `--driver NAME` | `virtio-blk-vhost-user` | libblkio driver name (e.g., `io_uring`, `virtio-blk-vhost-user`) |
 | `--queue-size N` | `256` | Virtio queue size |
 
 ### Output Options
@@ -66,6 +87,32 @@ truncate -s 1G /tmp/test-disk.raw
 | Arg | Default | Description |
 |-----|---------|-------------|
 | `--output-format FMT` | `normal` | Output format: `normal` or `json` |
+| `--help` | | Show usage information |
+| `--version` | | Show version |
+
+## Verify Modes
+
+### verify-flush
+
+Writes data with CRC32 checksums, flushes, then reads back and verifies integrity. Tests write persistence through the I/O stack.
+
+```bash
+./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw verify-flush --numjobs 4
+```
+
+### verify-pipeline
+
+Circular pipeline where each thread writes data that the next thread reads and verifies. Tests cross-thread write visibility without explicit flush.
+
+```bash
+./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw verify-pipeline --numjobs 4
+```
+
+Fault injection (for testing the verifier itself):
+
+```bash
+./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw verify-flush --verify-inject-fault
+```
 
 ## Example Output
 
@@ -87,6 +134,7 @@ lblk-bench: rw=randread, bs=4k, iodepth=32, numjobs=4, runtime=10s
 - **I/O Loop**: Busy-poll with `blkioq_do_io(q, comps, 0, iodepth, &zero_timeout)`. No sleeping, no eventfd.
 - **Latency**: Per-request timestamps via `user_data` pointer. Log2 histogram for percentile computation.
 - **Workload**: xorshift64 PRNG for random offsets (per-thread, no contention).
+- **Verify**: CRC32 checksums (IEEE polynomial) with thread-safe bump allocator for write-verify workflows.
 
 ## License
 
