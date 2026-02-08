@@ -38,6 +38,7 @@ enum rw_mode {
 	RW_RANDWRITE,
 	RW_READWRITE,
 	RW_RANDRW,
+	RW_VERIFY_FLUSH,
 };
 
 /* ── Per-request slot (passed as user_data) ────────────────────────── */
@@ -83,6 +84,9 @@ struct bench_args {
 	int sync_n;
 	int queue_size;
 	bool json_output;
+	int verify_min_sectors;
+	int verify_max_sectors;
+	bool verify_inject_fault;
 };
 
 /* ── Worker context ────────────────────────────────────────────────── */
@@ -200,6 +204,245 @@ static void stats_merge(struct worker_stats *dst, const struct worker_stats *src
 	if (src->lat_max_ns > dst->lat_max_ns) dst->lat_max_ns = src->lat_max_ns;
 	for (int i = 0; i < HIST_BUCKETS; i++)
 		dst->hist[i] += src->hist[i];
+}
+
+/* ── CRC32 (IEEE polynomial, lookup table) ─────────────────────────── */
+
+static uint32_t crc32_table[256];
+static bool crc32_table_init;
+
+static void crc32_init(void)
+{
+	if (crc32_table_init)
+		return;
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t c = i;
+		for (int j = 0; j < 8; j++)
+			c = (c >> 1) ^ (c & 1 ? 0xEDB88320U : 0);
+		crc32_table[i] = c;
+	}
+	crc32_table_init = true;
+}
+
+static uint32_t crc32_compute(const void *data, size_t len)
+{
+	const unsigned char *p = data;
+	uint32_t crc = 0xFFFFFFFF;
+	for (size_t i = 0; i < len; i++)
+		crc = (crc >> 8) ^ crc32_table[(crc ^ p[i]) & 0xFF];
+	return crc ^ 0xFFFFFFFF;
+}
+
+/* ── Shared sector allocator for verify-flush mode ─────────────────── */
+
+struct sector_alloc {
+	pthread_mutex_t lock;
+	uint64_t next_offset;  /* next available byte offset */
+	uint64_t limit;        /* upper bound (offset + size) */
+	uint64_t sector_size;  /* typically = bs */
+};
+
+static void sector_alloc_init(struct sector_alloc *sa, uint64_t base, uint64_t size, uint64_t sector_size)
+{
+	pthread_mutex_init(&sa->lock, NULL);
+	sa->next_offset = base;
+	sa->limit = base + size;
+	sa->sector_size = sector_size;
+}
+
+/* Returns starting offset, or UINT64_MAX if exhausted */
+static uint64_t sector_alloc_get(struct sector_alloc *sa, int n_sectors)
+{
+	uint64_t need = (uint64_t)n_sectors * sa->sector_size;
+	pthread_mutex_lock(&sa->lock);
+	uint64_t off = sa->next_offset;
+	if (off + need > sa->limit) {
+		pthread_mutex_unlock(&sa->lock);
+		return UINT64_MAX;
+	}
+	sa->next_offset = off + need;
+	pthread_mutex_unlock(&sa->lock);
+	return off;
+}
+
+static void sector_alloc_destroy(struct sector_alloc *sa)
+{
+	pthread_mutex_destroy(&sa->lock);
+}
+
+/* ── Verify-flush: per-region record ──────────────────────────────── */
+
+struct verify_record {
+	uint64_t offset;
+	uint32_t n_sectors;
+	uint32_t crc;
+};
+
+/* ── Verify-flush worker thread ───────────────────────────────────── */
+
+/*
+ * Helper: drain exactly n_ios completions from the queue.
+ * Returns number of I/O errors.
+ */
+static int do_io_drain(struct blkioq *q, struct blkio_completion *comps,
+		       int max_comps, int n_ios)
+{
+	int errs = 0;
+	int outstanding = n_ios;
+	while (outstanding > 0) {
+		int n = blkioq_do_io(q, comps, 1, max_comps, NULL);
+		if (n < 0)
+			return outstanding;
+		for (int i = 0; i < n; i++) {
+			if (comps[i].ret != 0)
+				errs++;
+			outstanding--;
+		}
+	}
+	return errs;
+}
+
+static void *verify_flush_thread(void *arg)
+{
+	struct worker_ctx *w = arg;
+	struct bench_args *a = w->args;
+	struct blkioq *q = w->queue;
+	unsigned char *base = (unsigned char *)w->region.addr;
+	struct sector_alloc *sa = (struct sector_alloc *)(uintptr_t)w->prng_state;
+	uint64_t bs = a->bs;
+	int max_sec = a->verify_max_sectors;
+
+	int max_comps = max_sec > a->iodepth ? max_sec : a->iodepth;
+	struct blkio_completion *comps = calloc(max_comps, sizeof(*comps));
+	if (!comps) {
+		fprintf(stderr, "verify job %d: alloc failed\n", w->job_index);
+		return NULL;
+	}
+
+	size_t rec_cap = 256;
+	size_t rec_count = 0;
+	struct verify_record *recs = malloc(rec_cap * sizeof(*recs));
+	if (!recs) {
+		fprintf(stderr, "verify job %d: alloc failed\n", w->job_index);
+		free(comps);
+		return NULL;
+	}
+
+	uint64_t prng = 0x853c49e6748fea9bULL ^ (uint64_t)(w->job_index + 1);
+	int range = a->verify_max_sectors - a->verify_min_sectors + 1;
+	int total_writes = 0;
+
+	stats_reset(&w->stats);
+
+	/*
+	 * Stage 1: Write one region at a time, drain before next.
+	 */
+	for (;;) {
+		int n_sec = a->verify_min_sectors;
+		if (range > 1)
+			n_sec += (int)(xorshift64(&prng) % (uint64_t)range);
+
+		uint64_t off = sector_alloc_get(sa, n_sec);
+		if (off == UINT64_MAX)
+			break;
+
+		size_t total_bytes = (size_t)n_sec * bs;
+		unsigned char *buf = base;
+
+		for (size_t i = 0; i + 8 <= total_bytes; i += 8) {
+			uint64_t val = off + i;
+			memcpy(buf + i, &val, 8);
+		}
+
+		uint32_t crc = crc32_compute(buf, total_bytes);
+
+		if (rec_count >= rec_cap) {
+			rec_cap *= 2;
+			recs = realloc(recs, rec_cap * sizeof(*recs));
+		}
+		recs[rec_count++] = (struct verify_record){
+			.offset = off,
+			.n_sectors = (uint32_t)n_sec,
+			.crc = crc,
+		};
+
+		for (int s = 0; s < n_sec; s++)
+			blkioq_write(q, off + (uint64_t)s * bs,
+				     buf + (size_t)s * bs, bs, NULL, 0);
+
+		int errs = do_io_drain(q, comps, max_comps, n_sec);
+		if (errs) {
+			fprintf(stderr, "verify job %d: %d write error(s) at offset %lu\n",
+				w->job_index, errs, (unsigned long)off);
+			w->stats.errors += (uint64_t)errs;
+		}
+		total_writes += n_sec;
+		w->stats.write_ios += (uint64_t)n_sec;
+		w->stats.write_bytes += (uint64_t)n_sec * bs;
+		w->stats.ios_done += (uint64_t)n_sec;
+		w->stats.bytes_done += (uint64_t)n_sec * bs;
+	}
+
+	/*
+	 * Stage 2: Flush
+	 */
+	blkioq_flush(q, NULL, 0);
+	int ferr = do_io_drain(q, comps, max_comps, 1);
+	if (ferr) {
+		fprintf(stderr, "verify job %d: flush failed\n", w->job_index);
+		w->stats.errors++;
+	}
+	w->stats.flushes++;
+
+	/*
+	 * Stage 3: Verify - re-read each region and check CRC
+	 */
+	int mismatches = 0;
+	for (size_t r = 0; r < rec_count; r++) {
+		struct verify_record *rec = &recs[r];
+		size_t total_bytes = (size_t)rec->n_sectors * bs;
+		unsigned char *buf = base;
+
+		for (uint32_t s = 0; s < rec->n_sectors; s++)
+			blkioq_read(q, rec->offset + (uint64_t)s * bs,
+				    buf + (size_t)s * bs, bs, NULL, 0);
+
+		int errs = do_io_drain(q, comps, max_comps, (int)rec->n_sectors);
+		if (errs) {
+			fprintf(stderr, "verify job %d: %d read error(s) at offset %lu\n",
+				w->job_index, errs, (unsigned long)rec->offset);
+			w->stats.errors += (uint64_t)errs;
+		}
+		w->stats.read_ios += rec->n_sectors;
+		w->stats.read_bytes += (uint64_t)rec->n_sectors * bs;
+		w->stats.ios_done += rec->n_sectors;
+		w->stats.bytes_done += (uint64_t)rec->n_sectors * bs;
+
+		/* Fault injection: flip one byte in first region to test detection */
+		if (a->verify_inject_fault && r == 0)
+			buf[0] ^= 0xFF;
+
+		uint32_t actual_crc = crc32_compute(buf, total_bytes);
+		if (actual_crc != rec->crc) {
+			fprintf(stderr, "VERIFY FAIL: job %d, offset %lu, %u sectors: "
+				"expected crc 0x%08x, got 0x%08x\n",
+				w->job_index, (unsigned long)rec->offset,
+				rec->n_sectors, rec->crc, actual_crc);
+			mismatches++;
+			w->stats.errors++;
+		}
+	}
+
+	if (mismatches == 0)
+		printf("verify job %d: OK - %zu regions (%d writes) verified\n",
+		       w->job_index, rec_count, total_writes);
+	else
+		printf("verify job %d: FAILED - %d/%zu regions mismatched\n",
+		       w->job_index, mismatches, rec_count);
+
+	free(recs);
+	free(comps);
+	return NULL;
 }
 
 /* ── Workload generation ───────────────────────────────────────────── */
@@ -418,6 +661,7 @@ static enum rw_mode parse_rw(const char *str)
 	if (!strcmp(str, "randwrite")) return RW_RANDWRITE;
 	if (!strcmp(str, "readwrite") || !strcmp(str, "rw")) return RW_READWRITE;
 	if (!strcmp(str, "randrw")) return RW_RANDRW;
+	if (!strcmp(str, "verify-flush")) return RW_VERIFY_FLUSH;
 	fprintf(stderr, "error: unknown --rw mode '%s'\n", str);
 	exit(1);
 }
@@ -430,7 +674,8 @@ static const char *rw_name(enum rw_mode m)
 	case RW_RANDREAD:  return "randread";
 	case RW_RANDWRITE: return "randwrite";
 	case RW_READWRITE: return "readwrite";
-	case RW_RANDRW:    return "randrw";
+	case RW_RANDRW:        return "randrw";
+	case RW_VERIFY_FLUSH:  return "verify-flush";
 	}
 	return "unknown";
 }
@@ -631,7 +876,7 @@ static void usage(void)
 "Required:\n"
 "  --path PATH           Device/socket path (meaning depends on --driver)\n"
 "  --rw MODE             I/O pattern: read, write, randread, randwrite,\n"
-"                        readwrite, randrw\n"
+"                        readwrite, randrw, verify-flush\n"
 "\n"
 "Workload options:\n"
 "  --bs SIZE             Block size (default: 4k)\n"
@@ -643,6 +888,9 @@ static void usage(void)
 "  --rwmixread PCT       Read percentage for mixed workloads (default: 50)\n"
 "  --ramp_time SEC       Warmup seconds before measuring (default: 0)\n"
 "  --sync N              Flush every N writes; 0=disabled (default: 0)\n"
+"\n"
+"Verify options (for --rw verify-flush):\n"
+"  --verify-sectors M:N  Sectors per write region (default: 1:16)\n"
 "\n"
 "libblkio options:\n"
 "  --driver NAME         libblkio driver (default: virtio-blk-vhost-user)\n"
@@ -675,6 +923,9 @@ int main(int argc, char **argv)
 		.sync_n = 0,
 		.queue_size = 256,
 		.json_output = false,
+		.verify_min_sectors = 1,
+		.verify_max_sectors = 16,
+		.verify_inject_fault = false,
 	};
 	bool rw_set = false;
 
@@ -692,9 +943,11 @@ int main(int argc, char **argv)
 		{"sync",          required_argument, 0, 'S'},
 		{"driver",        required_argument, 0, 'D'},
 		{"queue-size",    required_argument, 0, 'Q'},
-		{"output-format", required_argument, 0, 'F'},
-		{"help",          no_argument,       0, 'h'},
-		{"version",       no_argument,       0, 'V'},
+		{"output-format",   required_argument, 0, 'F'},
+		{"verify-sectors",       required_argument, 0, 'E'},
+		{"verify-inject-fault",  no_argument,       0, 'I'},
+		{"help",            no_argument,       0, 'h'},
+		{"version",         no_argument,       0, 'V'},
 		{0, 0, 0, 0},
 	};
 
@@ -737,6 +990,22 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case 'E': {
+			/* --verify-sectors=MIN:MAX */
+			char *colon = strchr(optarg, ':');
+			if (!colon) {
+				fprintf(stderr, "error: --verify-sectors expects MIN:MAX\n");
+				return 1;
+			}
+			args.verify_min_sectors = atoi(optarg);
+			args.verify_max_sectors = atoi(colon + 1);
+			if (args.verify_min_sectors < 1 || args.verify_max_sectors < args.verify_min_sectors) {
+				fprintf(stderr, "error: --verify-sectors: need 1 <= MIN <= MAX\n");
+				return 1;
+			}
+			break;
+		}
+		case 'I': args.verify_inject_fault = true; break;
 		case 'h': usage(); return 0;
 		case 'V': printf("lblk-bench %s\n", VERSION); return 0;
 		default: usage(); return 1;
@@ -768,7 +1037,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error: --numjobs must be >= 1\n");
 		return 1;
 	}
-	if (args.runtime < 1) {
+	if (args.runtime < 1 && args.rw != RW_VERIFY_FLUSH) {
 		fprintf(stderr, "error: --runtime must be >= 1\n");
 		return 1;
 	}
@@ -837,12 +1106,26 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	size_t region_size = (size_t)args.iodepth * args.bs;
+	bool is_verify = (args.rw == RW_VERIFY_FLUSH);
+	size_t region_size;
+	struct sector_alloc sa;
+
+	if (is_verify) {
+		crc32_init();
+		/* Each slot needs verify_max_sectors * bs for multi-sector regions */
+		region_size = (size_t)args.iodepth * (size_t)args.verify_max_sectors * args.bs;
+		sector_alloc_init(&sa, args.offset, args.size, args.bs);
+	} else {
+		region_size = (size_t)args.iodepth * args.bs;
+	}
 
 	for (int i = 0; i < args.numjobs; i++) {
 		workers[i].job_index = i;
 		workers[i].args = &args;
-		workers[i].prng_state = 0x853c49e6748fea9bULL ^ (uint64_t)(i + 1);
+		if (is_verify)
+			workers[i].prng_state = (uint64_t)(uintptr_t)&sa;
+		else
+			workers[i].prng_state = 0x853c49e6748fea9bULL ^ (uint64_t)(i + 1);
 		workers[i].seq_offset = 0;
 		workers[i].write_counter = 0;
 
@@ -894,8 +1177,9 @@ int main(int argc, char **argv)
 	struct cpu_usage cpu_before, cpu_after;
 	read_cpu_usage(&cpu_before);
 
+	void *(*thread_fn)(void *) = is_verify ? verify_flush_thread : worker_thread;
 	for (int i = 0; i < args.numjobs; i++) {
-		ret = pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
+		ret = pthread_create(&threads[i], NULL, thread_fn, &workers[i]);
 		if (ret) {
 			fprintf(stderr, "error: pthread_create (job %d): %s\n",
 				i, strerror(ret));
@@ -927,22 +1211,31 @@ int main(int argc, char **argv)
 	for (int i = 0; i < args.numjobs; i++)
 		stats_merge(&total, &workers[i].stats);
 
-	double wall_sec = (double)args.runtime;
+	if (is_verify) {
+		/* Verify mode: summary already printed per-thread; show totals */
+		printf("verify-flush: %lu writes, %lu reads, %lu errors, %lu flushes\n",
+		       (unsigned long)total.write_ios, (unsigned long)total.read_ios,
+		       (unsigned long)total.errors, (unsigned long)total.flushes);
+	} else {
+		double wall_sec = (double)args.runtime;
 
-	/* ── Print results ── */
-	if (args.json_output)
-		print_json_output(&args, &total, wall_sec, &cpu_before, &cpu_after);
-	else
-		print_human_output(&args, &total, wall_sec, &cpu_before, &cpu_after);
+		/* ── Print results ── */
+		if (args.json_output)
+			print_json_output(&args, &total, wall_sec, &cpu_before, &cpu_after);
+		else
+			print_human_output(&args, &total, wall_sec, &cpu_before, &cpu_after);
+	}
 
 	/* ── Cleanup ── */
 	for (int i = 0; i < args.numjobs; i++) {
 		blkio_unmap_mem_region(b, &workers[i].region);
 		blkio_free_mem_region(b, &workers[i].region);
 	}
+	if (is_verify)
+		sector_alloc_destroy(&sa);
 	free(workers);
 	free(threads);
 	blkio_destroy(&b);
 
-	return 0;
+	return (is_verify && total.errors) ? 1 : 0;
 }
