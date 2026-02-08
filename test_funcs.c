@@ -1,5 +1,5 @@
 /*
- * test_funcs.c - Unit tests for pure utility functions from lblk-bench.c
+ * test_funcs.c - Unit tests for pure utility functions from blkbench.c
  *
  * Tests: parse_size(), xorshift64(), format_size(), format_iops()
  *
@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── Copy of functions from lblk-bench.c ───────────────────────────── */
+/* ── Copy of functions from blkbench.c ───────────────────────────── */
 
 static int parse_size(const char *str, uint64_t *out)
 {

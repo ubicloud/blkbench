@@ -1,5 +1,5 @@
 /*
- * lblk-bench - minimal-overhead I/O benchmarking tool using libblkio
+ * blkbench - minimal-overhead I/O benchmarking tool using libblkio
  *
  * Benchmarks vhost-user-blk backends (and other libblkio drivers) with
  * busy-loop polling, per-request latency tracking, and fio-style output.
@@ -1106,7 +1106,7 @@ static void print_human_output(struct bench_args *a, struct worker_stats *total,
 
 	char bs_str[32];
 	format_size(a->bs, bs_str, sizeof(bs_str));
-	printf("lblk-bench: rw=%s, bs=%s, iodepth=%d, numjobs=%d, runtime=%ds\n", rw_name(a->rw),
+	printf("blkbench: rw=%s, bs=%s, iodepth=%d, numjobs=%d, runtime=%ds\n", rw_name(a->rw),
 	       bs_str, a->iodepth, a->numjobs, a->runtime);
 
 	/* Determine latency display unit based on p50 (like fio) */
@@ -1259,7 +1259,7 @@ static void print_json_output(struct bench_args *a, struct worker_stats *total, 
 static void usage(void)
 {
 	fprintf(stderr,
-		"Usage: lblk-bench --path PATH --rw MODE [options]\n"
+		"Usage: blkbench --path PATH --rw MODE [options]\n"
 		"\n"
 		"Required:\n"
 		"  --path PATH           Device/socket path (meaning depends on --driver)\n"
@@ -1433,7 +1433,7 @@ int main(int argc, char **argv)
 			usage();
 			return 0;
 		case 'V':
-			printf("lblk-bench %s\n", VERSION);
+			printf("blkbench %s\n", VERSION);
 			return 0;
 		default:
 			usage();

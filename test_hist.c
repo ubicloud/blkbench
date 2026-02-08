@@ -19,7 +19,7 @@
 #define NS_PER_MS    1000000ULL
 #define NS_PER_SEC   1000000000ULL
 
-/* ── Copy of histogram functions from lblk-bench.c ─────────────── */
+/* ── Copy of histogram functions from blkbench.c ─────────────── */
 
 static int hist_bucket(uint64_t lat_ns)
 {

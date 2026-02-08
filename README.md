@@ -1,4 +1,4 @@
-# lblk-bench
+# blkbench
 
 Minimal-overhead I/O benchmarking tool using [libblkio](https://gitlab.com/libblkio/libblkio). Designed for benchmarking vhost-user-blk backends (e.g., ubiblk) with busy-loop polling and direct libblkio calls.
 
@@ -27,20 +27,20 @@ Start ubiblk:
 
 Run benchmark:
 ```bash
-./lblk-bench --path /tmp/vhost.sock --rw randread --bs 4k --iodepth 32 --numjobs 4 --runtime 10
+./blkbench --path /tmp/vhost.sock --rw randread --bs 4k --iodepth 32 --numjobs 4 --runtime 10
 ```
 
 ### io_uring (local file baseline)
 
 ```bash
 truncate -s 1G /tmp/test-disk.raw
-./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw randread --bs 4k --iodepth 32
+./blkbench --driver io_uring --path /tmp/test-disk.raw --rw randread --bs 4k --iodepth 32
 ```
 
 ### JSON output
 
 ```bash
-./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw randread --output-format json | jq .
+./blkbench --driver io_uring --path /tmp/test-disk.raw --rw randread --output-format json | jq .
 ```
 
 ## CLI Reference
@@ -99,7 +99,7 @@ Used with `--rw verify-flush` and `--rw verify-pipeline` modes.
 Writes data with CRC32 checksums, flushes, then reads back and verifies integrity. Tests write persistence through the I/O stack.
 
 ```bash
-./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw verify-flush --numjobs 4
+./blkbench --driver io_uring --path /tmp/test-disk.raw --rw verify-flush --numjobs 4
 ```
 
 ### verify-pipeline
@@ -107,19 +107,19 @@ Writes data with CRC32 checksums, flushes, then reads back and verifies integrit
 Circular pipeline where each thread writes data that the next thread reads and verifies. Tests cross-thread write visibility without explicit flush.
 
 ```bash
-./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw verify-pipeline --numjobs 4
+./blkbench --driver io_uring --path /tmp/test-disk.raw --rw verify-pipeline --numjobs 4
 ```
 
 Fault injection (for testing the verifier itself):
 
 ```bash
-./lblk-bench --driver io_uring --path /tmp/test-disk.raw --rw verify-flush --verify-inject-fault
+./blkbench --driver io_uring --path /tmp/test-disk.raw --rw verify-flush --verify-inject-fault
 ```
 
 ## Example Output
 
 ```
-lblk-bench: rw=randread, bs=4k, iodepth=32, numjobs=4, runtime=10s
+blkbench: rw=randread, bs=4k, iodepth=32, numjobs=4, runtime=10s
   read: IOPS=320.0k, BW=1250MiB/s (1311MB/s)
     lat (usec): min=2.0, max=850.0, avg=12.5
     lat percentiles (usec):

@@ -5,13 +5,13 @@ LDFLAGS ?=
 PKG_CFLAGS  := $(shell pkg-config --cflags blkio)
 PKG_LDFLAGS := $(shell pkg-config --libs blkio)
 
-SRCS := lblk-bench.c test_hist.c test_funcs.c poc.c
+SRCS := blkbench.c test_hist.c test_funcs.c poc.c
 
 .PHONY: all clean test test-output test-unit test-cli test-smoke lint format
 
-all: lblk-bench
+all: blkbench
 
-lblk-bench: lblk-bench.c
+blkbench: blkbench.c
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -o $@ $< $(LDFLAGS) $(PKG_LDFLAGS) -lpthread -lm
 
 poc: poc.c
@@ -27,10 +27,10 @@ test-unit: test_hist test_funcs
 	./test_hist
 	./test_funcs
 
-test-cli: lblk-bench
+test-cli: blkbench
 	bash test_cli.sh
 
-test-smoke: lblk-bench
+test-smoke: blkbench
 	bash test_output.sh
 
 test: test-unit test-cli test-smoke
@@ -42,4 +42,4 @@ format:
 	clang-format -i $(SRCS)
 
 clean:
-	rm -f lblk-bench poc test_hist test_funcs
+	rm -f blkbench poc test_hist test_funcs
