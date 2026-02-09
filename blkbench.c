@@ -1535,7 +1535,18 @@ int main(int argc, char **argv)
 			blkio_destroy(&b);
 			return 1;
 		}
+		if (args.offset >= capacity) {
+			fprintf(stderr, "error: --offset %lu exceeds device capacity %lu\n",
+				(unsigned long)args.offset, (unsigned long)capacity);
+			blkio_destroy(&b);
+			return 1;
+		}
 		args.size = capacity - args.offset;
+	} else if (capacity > 0 && args.offset + args.size > capacity) {
+		fprintf(stderr, "error: --offset + --size (%lu) exceeds device capacity (%lu)\n",
+			(unsigned long)(args.offset + args.size), (unsigned long)capacity);
+		blkio_destroy(&b);
+		return 1;
 	}
 
 	/* Validate numjobs against backend's max-queues */
