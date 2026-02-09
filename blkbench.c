@@ -54,12 +54,15 @@ struct req_slot {
 /* ── Per-worker stats ──────────────────────────────────────────────── */
 
 struct worker_stats {
-	uint64_t ios_done;
-	uint64_t bytes_done;
-	uint64_t read_ios;
-	uint64_t write_ios;
-	uint64_t read_bytes;
-	uint64_t write_bytes;
+	/* Counters read by reporter thread while workers run — must be atomic.
+	 * All accesses use memory_order_relaxed (single writer per field). */
+	_Atomic uint64_t ios_done;
+	_Atomic uint64_t bytes_done;
+	_Atomic uint64_t read_ios;
+	_Atomic uint64_t write_ios;
+	_Atomic uint64_t read_bytes;
+	_Atomic uint64_t write_bytes;
+	/* Remaining fields: only read after workers are joined */
 	uint64_t errors;
 	uint64_t flushes;
 	uint64_t lat_min_ns;
@@ -67,6 +70,12 @@ struct worker_stats {
 	uint64_t lat_sum_ns;
 	uint64_t hist[HIST_BUCKETS];
 };
+
+/* Relaxed helpers for single-writer atomic counters */
+#define STAT_LOAD(field)       atomic_load_explicit(&(field), memory_order_relaxed)
+#define STAT_STORE(field, val) atomic_store_explicit(&(field), (val), memory_order_relaxed)
+#define STAT_ADD(field, val)   STAT_STORE(field, STAT_LOAD(field) + (val))
+#define STAT_INC(field)	       STAT_ADD(field, 1)
 
 /* ── Parsed arguments ──────────────────────────────────────────────── */
 
@@ -171,20 +180,30 @@ static uint64_t xorshift64(uint64_t *state)
 
 static void stats_reset(struct worker_stats *s)
 {
-	memset(s, 0, sizeof(*s));
+	STAT_STORE(s->ios_done, 0);
+	STAT_STORE(s->bytes_done, 0);
+	STAT_STORE(s->read_ios, 0);
+	STAT_STORE(s->write_ios, 0);
+	STAT_STORE(s->read_bytes, 0);
+	STAT_STORE(s->write_bytes, 0);
+	s->errors = 0;
+	s->flushes = 0;
 	s->lat_min_ns = UINT64_MAX;
+	s->lat_max_ns = 0;
+	s->lat_sum_ns = 0;
+	memset(s->hist, 0, sizeof(s->hist));
 }
 
 static void stats_record(struct worker_stats *s, uint64_t lat_ns, uint64_t bs, bool is_write)
 {
-	s->ios_done++;
-	s->bytes_done += bs;
+	STAT_INC(s->ios_done);
+	STAT_ADD(s->bytes_done, bs);
 	if (is_write) {
-		s->write_ios++;
-		s->write_bytes += bs;
+		STAT_INC(s->write_ios);
+		STAT_ADD(s->write_bytes, bs);
 	} else {
-		s->read_ios++;
-		s->read_bytes += bs;
+		STAT_INC(s->read_ios);
+		STAT_ADD(s->read_bytes, bs);
 	}
 	s->lat_sum_ns += lat_ns;
 	if (lat_ns < s->lat_min_ns)
@@ -196,12 +215,14 @@ static void stats_record(struct worker_stats *s, uint64_t lat_ns, uint64_t bs, b
 
 static void stats_merge(struct worker_stats *dst, const struct worker_stats *src)
 {
-	dst->ios_done += src->ios_done;
-	dst->bytes_done += src->bytes_done;
-	dst->read_ios += src->read_ios;
-	dst->write_ios += src->write_ios;
-	dst->read_bytes += src->read_bytes;
-	dst->write_bytes += src->write_bytes;
+	/* Called after workers are joined, so no concurrent writers.
+	 * Still need STAT_LOAD/STAT_ADD because fields are _Atomic. */
+	STAT_ADD(dst->ios_done, STAT_LOAD(src->ios_done));
+	STAT_ADD(dst->bytes_done, STAT_LOAD(src->bytes_done));
+	STAT_ADD(dst->read_ios, STAT_LOAD(src->read_ios));
+	STAT_ADD(dst->write_ios, STAT_LOAD(src->write_ios));
+	STAT_ADD(dst->read_bytes, STAT_LOAD(src->read_bytes));
+	STAT_ADD(dst->write_bytes, STAT_LOAD(src->write_bytes));
 	dst->errors += src->errors;
 	dst->flushes += src->flushes;
 	dst->lat_sum_ns += src->lat_sum_ns;
@@ -466,10 +487,10 @@ static void *verify_flush_thread(void *arg)
 			w->stats.errors += (uint64_t)errs;
 		}
 		total_writes += n_sec;
-		w->stats.write_ios += (uint64_t)n_sec;
-		w->stats.write_bytes += (uint64_t)n_sec * bs;
-		w->stats.ios_done += (uint64_t)n_sec;
-		w->stats.bytes_done += (uint64_t)n_sec * bs;
+		STAT_ADD(w->stats.write_ios, (uint64_t)n_sec);
+		STAT_ADD(w->stats.write_bytes, (uint64_t)n_sec * bs);
+		STAT_ADD(w->stats.ios_done, (uint64_t)n_sec);
+		STAT_ADD(w->stats.bytes_done, (uint64_t)n_sec * bs);
 	}
 
 	/*
@@ -502,10 +523,10 @@ static void *verify_flush_thread(void *arg)
 				w->job_index, errs, (unsigned long)rec->offset);
 			w->stats.errors += (uint64_t)errs;
 		}
-		w->stats.read_ios += rec->n_sectors;
-		w->stats.read_bytes += (uint64_t)rec->n_sectors * bs;
-		w->stats.ios_done += rec->n_sectors;
-		w->stats.bytes_done += (uint64_t)rec->n_sectors * bs;
+		STAT_ADD(w->stats.read_ios, rec->n_sectors);
+		STAT_ADD(w->stats.read_bytes, (uint64_t)rec->n_sectors * bs);
+		STAT_ADD(w->stats.ios_done, rec->n_sectors);
+		STAT_ADD(w->stats.bytes_done, (uint64_t)rec->n_sectors * bs);
 
 		/* Fault injection: flip one byte in first region to test detection */
 		if (a->verify_inject_fault && r == 0)
@@ -587,10 +608,10 @@ static void *verify_pipeline_thread(void *arg)
 			continue;
 		}
 		total_writes++;
-		w->stats.write_ios++;
-		w->stats.write_bytes += bs;
-		w->stats.ios_done++;
-		w->stats.bytes_done += bs;
+		STAT_INC(w->stats.write_ios);
+		STAT_ADD(w->stats.write_bytes, bs);
+		STAT_INC(w->stats.ios_done);
+		STAT_ADD(w->stats.bytes_done, bs);
 
 		/* Step 2: Send (offset, crc) to next thread's ring */
 		struct pipeline_entry e = {.offset = off, .crc = crc};
@@ -620,10 +641,10 @@ static void *verify_pipeline_thread(void *arg)
 			w->stats.errors++;
 			continue;
 		}
-		w->stats.read_ios++;
-		w->stats.read_bytes += bs;
-		w->stats.ios_done++;
-		w->stats.bytes_done += bs;
+		STAT_INC(w->stats.read_ios);
+		STAT_ADD(w->stats.read_bytes, bs);
+		STAT_INC(w->stats.ios_done);
+		STAT_ADD(w->stats.bytes_done, bs);
 
 		/* Fault injection: flip one byte on first verify */
 		if (a->verify_inject_fault && total_verifies == 0)
@@ -654,10 +675,10 @@ static void *verify_pipeline_thread(void *arg)
 				w->stats.errors++;
 				continue;
 			}
-			w->stats.read_ios++;
-			w->stats.read_bytes += bs;
-			w->stats.ios_done++;
-			w->stats.bytes_done += bs;
+			STAT_INC(w->stats.read_ios);
+			STAT_ADD(w->stats.read_bytes, bs);
+			STAT_INC(w->stats.ios_done);
+			STAT_ADD(w->stats.bytes_done, bs);
 
 			uint32_t actual_crc = crc32_compute(rbuf, bs);
 			if (actual_crc != recv.crc) {
@@ -892,17 +913,17 @@ static void *reporter_thread(void *arg)
 		if (atomic_load_explicit(&r->stop, memory_order_relaxed))
 			break;
 
-		/* Snapshot worker counters (slight races acceptable for display) */
+		/* Snapshot worker counters (relaxed atomics — no torn reads) */
 		uint64_t cur_ios = 0, cur_bytes = 0;
 		uint64_t cur_read_bytes = 0, cur_write_bytes = 0;
 		uint64_t cur_read_ios = 0, cur_write_ios = 0;
 		for (int i = 0; i < nj; i++) {
-			cur_ios += r->workers[i].stats.ios_done;
-			cur_bytes += r->workers[i].stats.bytes_done;
-			cur_read_bytes += r->workers[i].stats.read_bytes;
-			cur_write_bytes += r->workers[i].stats.write_bytes;
-			cur_read_ios += r->workers[i].stats.read_ios;
-			cur_write_ios += r->workers[i].stats.write_ios;
+			cur_ios += STAT_LOAD(r->workers[i].stats.ios_done);
+			cur_bytes += STAT_LOAD(r->workers[i].stats.bytes_done);
+			cur_read_bytes += STAT_LOAD(r->workers[i].stats.read_bytes);
+			cur_write_bytes += STAT_LOAD(r->workers[i].stats.write_bytes);
+			cur_read_ios += STAT_LOAD(r->workers[i].stats.read_ios);
+			cur_write_ios += STAT_LOAD(r->workers[i].stats.write_ios);
 		}
 
 		uint64_t t = now_ns();
