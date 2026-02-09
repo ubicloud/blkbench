@@ -1490,6 +1490,18 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error: --rwmixread must be 0-100\n");
 		return 1;
 	}
+	if (args.ramp_time < 0) {
+		fprintf(stderr, "error: --ramp_time must be >= 0\n");
+		return 1;
+	}
+	if (args.sync_n < 0) {
+		fprintf(stderr, "error: --sync must be >= 0\n");
+		return 1;
+	}
+	if (args.eta_interval < 0) {
+		fprintf(stderr, "error: --eta-interval must be >= 0\n");
+		return 1;
+	}
 
 	/* ── Create and connect blkio instance ── */
 	struct blkio *b = NULL;
