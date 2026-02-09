@@ -1524,6 +1524,17 @@ int main(int argc, char **argv)
 		args.size = capacity - args.offset;
 	}
 
+	/* Validate numjobs against backend's max-queues */
+	int max_queues = 0;
+	if (blkio_get_int(b, "max-queues", &max_queues) == 0
+	    && max_queues > 0 && args.numjobs > max_queues) {
+		fprintf(stderr,
+			"error: --numjobs %d exceeds backend's maximum queue count of %d\n",
+			args.numjobs, max_queues);
+		blkio_destroy(&b);
+		return 1;
+	}
+
 	/* Set queue properties */
 	blkio_set_int(b, "num-queues", args.numjobs);
 
