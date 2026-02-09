@@ -733,10 +733,10 @@ static uint64_t next_offset(struct worker_ctx *w)
 		uint64_t block = xorshift64(&w->prng_state) % n_blocks;
 		return a->offset + block * a->bs;
 	}
-	/* sequential */
+	/* sequential: wrap at aligned boundary to avoid IO extending beyond region */
 	uint64_t off = a->offset + w->seq_offset;
 	w->seq_offset += a->bs;
-	if (w->seq_offset >= io_range)
+	if (w->seq_offset >= n_blocks * a->bs)
 		w->seq_offset = 0;
 	return off;
 }
