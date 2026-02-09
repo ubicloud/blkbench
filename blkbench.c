@@ -967,12 +967,23 @@ static void read_cpu_usage(struct cpu_usage *c)
 		c->stime_ticks = 0;
 		return;
 	}
-	/* Fields: pid comm state ppid ... field14=utime field15=stime */
+	/*
+	 * Parse utime (field 14) and stime (field 15) from /proc/self/stat.
+	 * The comm field (field 2) is parenthesized and may contain spaces,
+	 * so skip past the closing ')' rather than using %s which stops at
+	 * the first space.  This matches the approach used by procps-ng/htop.
+	 */
+	char buf[1024];
 	unsigned long utime = 0, stime = 0;
-	int scanned = fscanf(f,
-			     "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u "
-			     "%*u %*u %*u %lu %lu",
-			     &utime, &stime);
+	int scanned = 0;
+	if (fgets(buf, sizeof(buf), f)) {
+		const char *cp = strrchr(buf, ')');
+		if (cp)
+			scanned = sscanf(cp + 2,
+					 "%*c %*d %*d %*d %*d %*d %*u %*u "
+					 "%*u %*u %*u %lu %lu",
+					 &utime, &stime);
+	}
 	fclose(f);
 	if (scanned == 2) {
 		c->utime_ticks = utime;
