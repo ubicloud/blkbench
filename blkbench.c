@@ -83,7 +83,7 @@ struct bench_args {
 	int rwmixread;
 	int ramp_time;
 	int sync_n;
-	int queue_size;
+	int queue_size; /* set to iodepth automatically */
 	bool json_output;
 	int direct;
 	int verify_min_sectors;
@@ -1282,7 +1282,6 @@ static void usage(void)
 		"\n"
 		"libblkio options:\n"
 		"  --driver NAME         libblkio driver (default: virtio-blk-vhost-user)\n"
-		"  --queue-size N        Virtio queue size (default: server's advertised value)\n"
 		"  --direct 0|1          Use direct I/O, bypass page cache (default: 1)\n"
 		"\n"
 		"Output options:\n"
@@ -1310,7 +1309,7 @@ int main(int argc, char **argv)
 	    .rwmixread = 50,
 	    .ramp_time = 0,
 	    .sync_n = 0,
-	    .queue_size = 0, /* 0 = auto-detect from backend */
+	    .queue_size = 0, /* set to iodepth after arg parsing */
 	    .json_output = false,
 	    .direct = 1,
 	    .verify_min_sectors = 1,
@@ -1319,7 +1318,6 @@ int main(int argc, char **argv)
 	    .eta_interval = 2,
 	};
 	bool rw_set = false;
-	bool queue_size_set = false;
 
 	static struct option long_options[] = {
 	    {"path", required_argument, 0, 'p'},
@@ -1334,7 +1332,7 @@ int main(int argc, char **argv)
 	    {"ramp_time", required_argument, 0, 'R'},
 	    {"sync", required_argument, 0, 'S'},
 	    {"driver", required_argument, 0, 'D'},
-	    {"queue-size", required_argument, 0, 'Q'},
+	    /* --queue-size removed: uses iodepth as queue size */
 	    {"output-format", required_argument, 0, 'F'},
 	    {"verify-sectors", required_argument, 0, 'E'},
 	    {"direct", required_argument, 0, 'O'},
@@ -1394,10 +1392,7 @@ int main(int argc, char **argv)
 		case 'D':
 			args.driver = optarg;
 			break;
-		case 'Q':
-			args.queue_size = atoi(optarg);
-			queue_size_set = true;
-			break;
+		/* 'Q' removed: queue-size derived from iodepth */
 		case 'F':
 			if (!strcmp(optarg, "json"))
 				args.json_output = true;
@@ -1454,6 +1449,9 @@ int main(int argc, char **argv)
 		usage();
 		return 1;
 	}
+
+	/* Use iodepth as queue size — no need for a separate knob */
+	args.queue_size = args.iodepth;
 
 	/* Validate values */
 	if (args.bs < 512 || (args.bs & (args.bs - 1)) != 0) {
@@ -1538,54 +1536,13 @@ int main(int argc, char **argv)
 	/* Set queue properties */
 	blkio_set_int(b, "num-queues", args.numjobs);
 
-	/*
-	 * Negotiate queue-size. For virtio-blk drivers, "max-queue-size" and
-	 * "queue-size" are available after connect. For non-virtio drivers the
-	 * properties don't exist and we skip the check entirely.
-	 *
-	 * Note: for vhost-user, libblkio reports max-queue-size as its own
-	 * internal limit (32768), not the backend's actual limit. The backend's
-	 * limit is only discovered during blkio_start() when SET_VRING_NUM is
-	 * sent. We still validate against max-queue-size to catch obvious
-	 * misconfigurations, and provide a helpful hint on start failure.
-	 */
-	int max_queue_size = 0;
-	bool has_max_qs = (blkio_get_int(b, "max-queue-size", &max_queue_size) == 0
-			   && max_queue_size > 0);
-
-	if (queue_size_set) {
-		if (has_max_qs && args.queue_size > max_queue_size) {
-			fprintf(stderr,
-				"error: --queue-size %d exceeds backend's maximum queue size of %d\n",
-				args.queue_size, max_queue_size);
-			blkio_destroy(&b);
-			return 1;
-		}
-		blkio_set_int(b, "queue-size", args.queue_size);
-	} else if (has_max_qs) {
-		/*
-		 * User didn't set --queue-size. Read the driver's current default
-		 * and clamp to max-queue-size. This uses libblkio's default (256)
-		 * rather than our own hardcoded value.
-		 */
-		int server_qs = 0;
-		if (blkio_get_int(b, "queue-size", &server_qs) == 0 && server_qs > 0)
-			args.queue_size = server_qs;
-		if (args.queue_size > max_queue_size)
-			args.queue_size = max_queue_size;
-		if (args.queue_size > 0)
-			blkio_set_int(b, "queue-size", args.queue_size);
-	}
-	/* else: non-virtio driver, don't touch queue-size */
+	/* Queue size = iodepth. This is the natural minimum and avoids
+	 * negotiation issues with backends that have small queue limits. */
+	blkio_set_int(b, "queue-size", args.queue_size);
 
 	ret = blkio_start(b);
 	if (ret < 0) {
 		fprintf(stderr, "error: blkio_start: %s\n", blkio_get_error_msg());
-		if (has_max_qs)
-			fprintf(stderr,
-				"hint: the backend may not support --queue-size %d"
-				" — try a smaller power of two (e.g. 128, 64, 32)\n",
-				args.queue_size);
 		blkio_destroy(&b);
 		return 1;
 	}

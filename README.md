@@ -80,7 +80,6 @@ Used with `--rw verify-flush` and `--rw verify-pipeline` modes.
 | Arg | Default | Description |
 |-----|---------|-------------|
 | `--driver NAME` | `virtio-blk-vhost-user` | libblkio driver name (e.g., `io_uring`, `virtio-blk-vhost-user`) |
-| `--queue-size N` | `256` | Virtio queue size |
 | `--direct 0\|1` | `1` | Use direct I/O, bypass page cache |
 
 ### Output Options
