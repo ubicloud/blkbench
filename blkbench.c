@@ -443,7 +443,12 @@ static void *verify_flush_thread(void *arg)
 
 		if (rec_count >= rec_cap) {
 			rec_cap *= 2;
-			recs = realloc(recs, rec_cap * sizeof(*recs));
+			struct verify_record *new_recs = realloc(recs, rec_cap * sizeof(*recs));
+			if (!new_recs) {
+				fprintf(stderr, "verify job %d: realloc failed\n", w->job_index);
+				break;
+			}
+			recs = new_recs;
 		}
 		recs[rec_count++] = (struct verify_record){
 		    .offset = off,
