@@ -1589,10 +1589,22 @@ int main(int argc, char **argv)
 	struct sector_alloc sa;
 	struct pipeline_ctx pctx = {0};
 
+	/* 16 GiB per-worker memory region limit */
+	const size_t max_region = (size_t)16 * 1024 * 1024 * 1024;
+
 	if (is_verify_flush) {
 		crc32_init();
 		/* Each slot needs verify_max_sectors * bs for multi-sector regions */
-		region_size = (size_t)args.iodepth * (size_t)args.verify_max_sectors * args.bs;
+		size_t slots = (size_t)args.iodepth * (size_t)args.verify_max_sectors;
+		if (slots / (size_t)args.iodepth != (size_t)args.verify_max_sectors ||
+		    slots > SIZE_MAX / args.bs) {
+			fprintf(stderr, "error: iodepth * verify_max_sectors * bs overflows\n");
+			free(workers);
+			free(threads);
+			blkio_destroy(&b);
+			return 1;
+		}
+		region_size = slots * args.bs;
 		sector_alloc_init(&sa, args.offset, args.size, args.bs);
 	} else if (is_verify_pipeline) {
 		crc32_init();
@@ -1613,7 +1625,25 @@ int main(int argc, char **argv)
 		for (int i = 0; i < args.numjobs; i++)
 			pipeline_ring_init(&pctx.rings[i]);
 	} else {
+		if ((size_t)args.iodepth > SIZE_MAX / args.bs) {
+			fprintf(stderr, "error: iodepth * bs overflows\n");
+			free(workers);
+			free(threads);
+			blkio_destroy(&b);
+			return 1;
+		}
 		region_size = (size_t)args.iodepth * args.bs;
+	}
+
+	if (region_size > max_region) {
+		fprintf(
+		    stderr,
+		    "error: memory region per worker = %zu bytes (%.1f GiB) exceeds 16 GiB limit\n",
+		    region_size, (double)region_size / (1024.0 * 1024.0 * 1024.0));
+		free(workers);
+		free(threads);
+		blkio_destroy(&b);
+		return 1;
 	}
 
 	for (int i = 0; i < args.numjobs; i++) {
