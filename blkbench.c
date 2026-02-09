@@ -776,6 +776,7 @@ static void *worker_thread(void *arg)
 	bool ramped = (a->ramp_time == 0);
 
 	/* Pre-fill: queue iodepth initial requests */
+	int outstanding = 0;
 	for (int i = 0; i < depth; i++) {
 		slots[i].index = i;
 		slots[i].is_write = next_is_write(w);
@@ -787,6 +788,7 @@ static void *worker_thread(void *arg)
 			blkioq_write(q, slots[i].offset, buf, a->bs, &slots[i], 0);
 		else
 			blkioq_read(q, slots[i].offset, buf, a->bs, &slots[i], 0);
+		outstanding++;
 	}
 
 	w->start_ns = now_ns();
@@ -798,6 +800,7 @@ static void *worker_thread(void *arg)
 		int n = blkioq_do_io(q, comps, 0, depth, &zero_timeout);
 		if (n < 0) {
 			w->stats.errors++;
+			outstanding = 0; /* can't drain after error */
 			break;
 		}
 
@@ -811,11 +814,14 @@ static void *worker_thread(void *arg)
 
 		/* Check end */
 		if (t >= w->end_ns) {
-			/* drain: don't requeue, just process completions */
+			/* Process completions but don't requeue */
 			for (int i = 0; i < n; i++) {
 				struct req_slot *s = comps[i].user_data;
-				if (!s)
+				if (!s) {
+					outstanding--;
 					continue; /* flush completion */
+				}
+				outstanding--;
 				if (comps[i].ret != 0) {
 					w->stats.errors++;
 					continue;
@@ -828,8 +834,10 @@ static void *worker_thread(void *arg)
 
 		for (int i = 0; i < n; i++) {
 			struct req_slot *s = comps[i].user_data;
-			if (!s)
+			if (!s) {
+				outstanding--;
 				continue; /* flush completion */
+			}
 			if (comps[i].ret != 0) {
 				w->stats.errors++;
 				/* still re-queue to maintain depth */
@@ -844,6 +852,7 @@ static void *worker_thread(void *arg)
 				if (w->write_counter >= a->sync_n) {
 					w->write_counter = 0;
 					blkioq_flush(q, NULL, 0);
+					outstanding++;
 					w->stats.flushes++;
 				}
 			}
@@ -859,6 +868,14 @@ static void *worker_thread(void *arg)
 			else
 				blkioq_read(q, s->offset, buf, a->bs, s, 0);
 		}
+	}
+
+	/* Drain remaining in-flight IOs before returning */
+	while (outstanding > 0) {
+		int n = blkioq_do_io(q, comps, 1, depth, NULL);
+		if (n < 0)
+			break;
+		outstanding -= n;
 	}
 
 	free(slots);
