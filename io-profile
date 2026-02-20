@@ -1,0 +1,684 @@
+#!/bin/bash
+# io-profile: Reusable IO + CPU profiling wrapper
+# Runs an arbitrary command and produces a standardized IO + CPU profile report.
+#
+# Requires: bpftrace (root), iostat, mpstat, awk
+# Usage: sudo io-profile [options] -- command [args...]
+set -euo pipefail
+
+###############################################################################
+# Defaults & argument parsing
+###############################################################################
+OUTPUT_DIR="./io-profile-results"
+DEVICE=""
+FILTER_PID=""
+EMIT_JSON=false
+VERBOSE=false
+
+usage() {
+    cat <<'USAGE'
+Usage: io-profile [options] -- command [args...]
+
+Options:
+  -o, --output DIR    Output directory (default: ./io-profile-results)
+  -d, --device DEV    Block device to monitor (default: auto-detect from cwd)
+  -p, --pid PID       Only trace this PID and children
+      --json          Also emit machine-readable JSON summary
+  -v, --verbose       Show progress messages
+  -h, --help          Show this help
+
+Examples:
+  sudo io-profile -- dd if=/dev/zero of=/tmp/test bs=1M count=1000
+  sudo io-profile --json -o results/ -- fio job.fio
+  sudo io-profile -d nvme0n1 -- pgbench -c 8 -T 60 mydb
+USAGE
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--output)  OUTPUT_DIR="$2"; shift 2 ;;
+        -d|--device)  DEVICE="$2"; shift 2 ;;
+        -p|--pid)     FILTER_PID="$2"; shift 2 ;;
+        --json)       EMIT_JSON=true; shift ;;
+        -v|--verbose) VERBOSE=true; shift ;;
+        -h|--help)    usage ;;
+        --)           shift; break ;;
+        *)            echo "Unknown option: $1" >&2; usage ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    echo "Error: no command specified after --" >&2
+    usage
+fi
+
+COMMAND=("$@")
+COMMAND_STR="${COMMAND[*]}"
+
+###############################################################################
+# Setup
+###############################################################################
+mkdir -p "$OUTPUT_DIR"
+TMPDIR=$(mktemp -d "${OUTPUT_DIR}/.io-profile-tmp.XXXXXX")
+
+# Auto-detect device from cwd mount
+if [[ -z "$DEVICE" ]]; then
+    DEV_PATH=$(df --output=source . 2>/dev/null | tail -1)
+    # Strip partition number to get the base device
+    DEVICE=$(lsblk -no PKNAME "$DEV_PATH" 2>/dev/null | head -1)
+    if [[ -z "$DEVICE" ]]; then
+        # Fallback: use the partition device itself
+        DEVICE=$(basename "$DEV_PATH")
+    fi
+fi
+
+# Get dev_t for bpftrace device filter
+DEV_MAJOR=$(cat "/sys/class/block/${DEVICE}/dev" 2>/dev/null | cut -d: -f1 || echo "")
+DEV_MINOR=$(cat "/sys/class/block/${DEVICE}/dev" 2>/dev/null | cut -d: -f2 || echo "")
+if [[ -n "$DEV_MAJOR" && -n "$DEV_MINOR" ]]; then
+    DEV_T=$(printf '0x%x' $(( (DEV_MAJOR << 20) | DEV_MINOR )))
+else
+    echo "Warning: could not determine dev_t for $DEVICE, tracing all devices" >&2
+    DEV_T=""
+fi
+
+KERNEL_VERSION=$(uname -r)
+DATE_START=$(date -Iseconds)
+
+$VERBOSE && echo "io-profile: device=$DEVICE (dev_t=$DEV_T), output=$OUTPUT_DIR"
+
+###############################################################################
+# PID filter expressions for bpftrace
+###############################################################################
+# We build filter expressions based on whether we're doing PID or device filtering.
+# For device filter: /args.dev == DEV_T/
+# For PID filter: /pid == PID/ (bpftrace will also see child threads)
+# Note: block layer tracepoints have args->dev; syscall tracepoints use pid.
+if [[ -n "$FILTER_PID" ]]; then
+    BLK_FILTER="/pid == ${FILTER_PID}/"
+    SYS_FILTER="/pid == ${FILTER_PID}/"
+elif [[ -n "$DEV_T" ]]; then
+    BLK_FILTER="/args.dev == ${DEV_T}/"
+    SYS_FILTER=""  # can't filter syscalls by device easily
+else
+    BLK_FILTER=""
+    SYS_FILTER=""
+fi
+
+###############################################################################
+# Cleanup trap
+###############################################################################
+PIDS_TO_KILL=()
+cleanup() {
+    $VERBOSE && echo "io-profile: cleaning up..."
+    for p in "${PIDS_TO_KILL[@]}"; do
+        kill "$p" 2>/dev/null || true
+    done
+    # Wait briefly for processes to flush
+    for p in "${PIDS_TO_KILL[@]}"; do
+        wait "$p" 2>/dev/null || true
+    done
+    rm -rf "$TMPDIR"
+}
+trap cleanup EXIT INT TERM
+
+###############################################################################
+# Probe 1: Block IO metrics (bpftrace)
+# Collects: queue depth, block size, seq/random, r/w, latency, per-thread stats
+###############################################################################
+$VERBOSE && echo "io-profile: starting block IO probe..."
+
+# We output raw event data lines for post-processing rather than using bpftrace
+# histograms, so we can compute exact percentiles.
+# Format per IO completion:
+#   DATA <comm> <tid> <rwbs> <bytes> <latency_us> <sector> <is_sequential>
+#
+# We also track inflight count for queue depth snapshots on each issue/complete.
+#   QDEPTH <depth>
+
+cat > "$TMPDIR/blkio.bt" <<'BTEOF'
+BEGIN {
+    @inflight = (int64)0;
+    @prev_sector = (uint64)0;
+    @prev_valid = (int64)0;
+}
+
+tracepoint:block:block_io_start BLKFILTER {
+    @start_ns[args.dev, args.sector] = nsecs;
+    @inflight++;
+    @qdepth_hist = lhist(@inflight, 0, 512, 1);
+
+    // Sequential detection
+    $seq = 0;
+    if (@prev_valid) {
+        $delta = (int64)(args.sector) - (int64)(@prev_sector);
+        if ($delta < 0) { $delta = -$delta; }
+        if ($delta <= 256) { $seq = 1; }
+    }
+    @prev_sector = args.sector + args.nr_sector;
+    @prev_valid = 1;
+
+    // Emit DATA at start time where we have correct comm/tid/rwbs/bytes
+    printf("DATA %s %d %s %u %llu %d\n",
+        comm, tid, args.rwbs, args.bytes, (uint64)args.sector, $seq);
+}
+
+tracepoint:block:block_io_done BLKFILTER {
+    @inflight--;
+    $start = @start_ns[args.dev, args.sector];
+    if ($start > 0) {
+        printf("LAT %llu\n", (nsecs - $start) / 1000);
+        delete(@start_ns[args.dev, args.sector]);
+    }
+}
+
+END {
+    clear(@start_ns);
+    clear(@inflight);
+    clear(@prev_sector);
+    clear(@prev_valid);
+}
+BTEOF
+
+# Substitute the block filter
+if [[ -n "$BLK_FILTER" ]]; then
+    sed -i "s|BLKFILTER|${BLK_FILTER}|g" "$TMPDIR/blkio.bt"
+else
+    sed -i "s|BLKFILTER||g" "$TMPDIR/blkio.bt"
+fi
+
+bpftrace "$TMPDIR/blkio.bt" > "$TMPDIR/blkio.raw" 2>"$TMPDIR/blkio.err" &
+PIDS_TO_KILL+=($!)
+PID_BLKIO=$!
+
+###############################################################################
+# Probe 2: fsync + O_DIRECT detection (bpftrace on syscalls)
+###############################################################################
+$VERBOSE && echo "io-profile: starting syscall probe..."
+
+cat > "$TMPDIR/syscall.bt" <<'BTEOF'
+tracepoint:syscalls:sys_enter_fsync SYSFILTER {
+    @fsync_count++;
+    @fsync_by_thread[comm, tid]++;
+}
+tracepoint:syscalls:sys_enter_fdatasync SYSFILTER {
+    @fdatasync_count++;
+    @fsync_by_thread[comm, tid]++;
+}
+tracepoint:syscalls:sys_enter_sync_file_range SYSFILTER {
+    @sync_file_range_count++;
+    @fsync_by_thread[comm, tid]++;
+}
+tracepoint:syscalls:sys_enter_openat SYSFILTER {
+    // O_DIRECT = 0x4000 on x86_64
+    if (args.flags & 0x4000) {
+        @odirect_opens++;
+    }
+}
+BTEOF
+
+if [[ -n "$SYS_FILTER" ]]; then
+    sed -i "s|SYSFILTER|${SYS_FILTER}|g" "$TMPDIR/syscall.bt"
+else
+    sed -i "s|SYSFILTER||g" "$TMPDIR/syscall.bt"
+fi
+
+bpftrace "$TMPDIR/syscall.bt" > "$TMPDIR/syscall.raw" 2>"$TMPDIR/syscall.err" &
+PIDS_TO_KILL+=($!)
+PID_SYSCALL=$!
+
+###############################################################################
+# iostat for throughput sampling (1-second intervals)
+###############################################################################
+$VERBOSE && echo "io-profile: starting iostat..."
+iostat -xdz "$DEVICE" 1 > "$TMPDIR/iostat.raw" 2>/dev/null &
+PIDS_TO_KILL+=($!)
+PID_IOSTAT=$!
+
+###############################################################################
+# mpstat for CPU utilization (1-second intervals)
+###############################################################################
+$VERBOSE && echo "io-profile: starting mpstat..."
+mpstat 1 > "$TMPDIR/mpstat.raw" 2>/dev/null &
+PIDS_TO_KILL+=($!)
+PID_MPSTAT=$!
+
+###############################################################################
+# Context switches baseline
+###############################################################################
+CS_BEFORE=$(awk '{print $1, $2}' /proc/stat 2>/dev/null | grep -E '^ctxt ' | awk '{print $2}')
+
+###############################################################################
+# Wait for probes to attach
+###############################################################################
+sleep 2
+
+###############################################################################
+# Run the user command
+###############################################################################
+$VERBOSE && echo "io-profile: running command: ${COMMAND_STR}"
+TIME_START=$(date +%s.%N)
+
+set +e
+"${COMMAND[@]}"
+CMD_EXIT=$?
+set -e
+
+TIME_END=$(date +%s.%N)
+DURATION=$(awk "BEGIN {printf \"%.1f\", $TIME_END - $TIME_START}")
+
+$VERBOSE && echo "io-profile: command exited with code $CMD_EXIT (${DURATION}s)"
+
+###############################################################################
+# Collect final stats, then stop probes
+###############################################################################
+CS_AFTER=$(awk '{print $1, $2}' /proc/stat 2>/dev/null | grep -E '^ctxt ' | awk '{print $2}')
+
+# Give probes a moment to flush
+sleep 1
+
+# Stop bpftrace probes (SIGINT so they print END block)
+kill -INT "$PID_BLKIO" 2>/dev/null || true
+kill -INT "$PID_SYSCALL" 2>/dev/null || true
+kill "$PID_IOSTAT" 2>/dev/null || true
+kill "$PID_MPSTAT" 2>/dev/null || true
+
+wait "$PID_BLKIO" 2>/dev/null || true
+wait "$PID_SYSCALL" 2>/dev/null || true
+wait "$PID_IOSTAT" 2>/dev/null || true
+wait "$PID_MPSTAT" 2>/dev/null || true
+
+# Clear pids so cleanup trap doesn't try again
+PIDS_TO_KILL=()
+
+###############################################################################
+# Post-processing: block IO data
+###############################################################################
+$VERBOSE && echo "io-profile: processing results..."
+
+# Phase 1: Extract summary stats, per-thread data, and raw values for histograms
+# DATA format: DATA <comm> <tid> <rwbs> <bytes> <sector> <is_seq>
+# LAT format: LAT <latency_us>
+awk -v duration="$DURATION" '
+/^LAT / { print $2 > TMPDIR "/lat.vals"; next }
+/^DATA / {
+    tcomm = $2; ttid = $3; rwbs = $4; bytes = $5; sector = $6; is_seq = $7;
+    print bytes > TMPDIR "/bs.vals";
+    tkey = tcomm ":" ttid;
+    if (!(tkey in thread_iops)) {
+        thread_iops[tkey] = 0; thread_read_bytes[tkey] = 0;
+        thread_write_bytes[tkey] = 0; thread_seq[tkey] = 0;
+        thread_total[tkey] = 0; thread_comm[tkey] = tcomm;
+        thread_tid[tkey] = ttid;
+    }
+    thread_iops[tkey]++; thread_total[tkey]++;
+    if (index(rwbs, "R") > 0) { total_reads++; total_read_bytes += bytes; thread_read_bytes[tkey] += bytes; }
+    else if (index(rwbs, "W") > 0) { total_writes++; total_write_bytes += bytes; thread_write_bytes[tkey] += bytes; }
+    if (is_seq) { total_seq++; thread_seq[tkey]++; } else { total_random++; }
+}
+END {
+    total_io = total_reads + total_writes;
+    dur = duration + 0; if (dur <= 0) dur = 1;
+    rw_read_pct = 0; rw_write_pct = 0;
+    if (total_io > 0) { rw_read_pct = int(total_reads * 100 / total_io); rw_write_pct = 100 - rw_read_pct; }
+    seq_pct = 0; total_seqrand = total_seq + total_random;
+    if (total_seqrand > 0) seq_pct = int(total_seq * 100 / total_seqrand);
+    unique_threads = 0; for (k in thread_iops) unique_threads++;
+    printf "read_mbs=%.1f\nwrite_mbs=%.1f\nread_iops=%.0f\nwrite_iops=%.0f\n", \
+        (total_read_bytes/1048576)/dur, (total_write_bytes/1048576)/dur, total_reads/dur, total_writes/dur;
+    printf "io_threads=%d\nrw_read_pct=%d\nrw_write_pct=%d\nseq_pct=%d\ntotal_ios=%d\n", \
+        unique_threads, rw_read_pct, rw_write_pct, seq_pct, total_io;
+    for (k in thread_iops) {
+        t_iops = thread_iops[k] / dur; t_rmb = thread_read_bytes[k] / 1048576;
+        t_wmb = thread_write_bytes[k] / 1048576; t_seq_pct = 0;
+        if (thread_total[k] > 0) t_seq_pct = int(thread_seq[k] * 100 / thread_total[k]);
+        printf "THREAD %s %s %.0f %.1f %.1f %d\n", thread_comm[k], thread_tid[k], t_iops, t_rmb, t_wmb, t_seq_pct;
+    }
+}
+' TMPDIR="$TMPDIR" "$TMPDIR/blkio.raw" > "$TMPDIR/blkio.summary"
+
+# Phase 2: Compute percentiles using sort -n (O(n log n)) + streaming awk
+compute_percentiles() {
+    local file="$1" prefix="$2"
+    if [[ ! -s "$file" ]]; then
+        echo "${prefix}_p25=0"; echo "${prefix}_p50=0"; echo "${prefix}_p75=0"
+        echo "${prefix}_p99=0"; echo "${prefix}_max=0"; echo "${prefix}_samples=0"
+        return
+    fi
+    sort -n "$file" | awk -v prefix="$prefix" '
+    { vals[NR] = $1; }
+    END {
+        n = NR;
+        printf "%s_p25=%d\n", prefix, vals[int(n*0.25)+1];
+        printf "%s_p50=%d\n", prefix, vals[int(n*0.50)+1];
+        printf "%s_p75=%d\n", prefix, vals[int(n*0.75)+1];
+        printf "%s_p99=%d\n", prefix, vals[int(n*0.99)+1];
+        printf "%s_max=%d\n", prefix, vals[n];
+        printf "%s_samples=%d\n", prefix, n;
+    }'
+}
+# Parse bpftrace lhist for queue depth (from the raw output after END)
+# Format: [lo, hi)   count |@@@@|
+# Extract lo and count, expand into individual values for percentile computation
+awk '
+/^@qdepth_hist/ { in_hist=1; next }
+in_hist && /^\[/ {
+    # Strip everything after the bar chart
+    line = $0; sub(/\|.*/, "", line);
+    # Now: "[lo, hi)   count"
+    gsub(/[^0-9 ]/, " ", line);
+    # Now: " lo  hi    count"
+    n = split(line, nums);
+    if (n >= 3) {
+        lo = nums[1] + 0;
+        count = nums[3] + 0;
+        for (i = 0; i < count; i++) print lo;
+    }
+}
+in_hist && !/^\[/ && !/^$/ { in_hist=0 }
+' "$TMPDIR/blkio.raw" > "$TMPDIR/qd.vals"
+
+compute_percentiles "$TMPDIR/qd.vals" "qdepth" >> "$TMPDIR/blkio.summary"
+compute_percentiles "$TMPDIR/bs.vals" "blocksize" >> "$TMPDIR/blkio.summary"
+compute_percentiles "$TMPDIR/lat.vals" "latency" >> "$TMPDIR/blkio.summary"
+
+###############################################################################
+# Post-processing: syscall data (fsync counts, O_DIRECT)
+###############################################################################
+# Parse bpftrace map output
+FSYNC_COUNT=0
+FDATASYNC_COUNT=0
+SYNC_FILE_RANGE_COUNT=0
+ODIRECT_OPENS=0
+FSYNC_BY_THREAD=""
+
+while IFS= read -r line; do
+    if [[ "$line" =~ @fsync_count:\ ([0-9]+) ]]; then
+        FSYNC_COUNT="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ @fdatasync_count:\ ([0-9]+) ]]; then
+        FDATASYNC_COUNT="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ @sync_file_range_count:\ ([0-9]+) ]]; then
+        SYNC_FILE_RANGE_COUNT="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ @odirect_opens:\ ([0-9]+) ]]; then
+        ODIRECT_OPENS="${BASH_REMATCH[1]}"
+    fi
+done < "$TMPDIR/syscall.raw"
+
+TOTAL_FSYNC=$((FSYNC_COUNT + FDATASYNC_COUNT + SYNC_FILE_RANGE_COUNT))
+FSYNC_RATE=$(awk "BEGIN {printf \"%.1f\", $TOTAL_FSYNC / ($DURATION > 0 ? $DURATION : 1)}")
+ODIRECT_DETECTED="No"
+if [[ "$ODIRECT_OPENS" -gt 0 ]]; then
+    ODIRECT_DETECTED="Yes ($ODIRECT_OPENS opens)"
+fi
+
+# Parse per-thread fsync from bpftrace map output
+# Format: @fsync_by_thread[comm, tid]: count
+declare -A THREAD_FSYNC
+while IFS= read -r line; do
+    if [[ "$line" =~ @fsync_by_thread\[([^,]+),\ *([0-9]+)\]:\ ([0-9]+) ]]; then
+        key="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+        THREAD_FSYNC["$key"]="${BASH_REMATCH[3]}"
+    fi
+done < "$TMPDIR/syscall.raw"
+
+###############################################################################
+# Post-processing: CPU stats from mpstat
+###############################################################################
+# mpstat output: columns include %usr, %sys, %iowait, %idle etc.
+# Extract numeric lines, compute percentiles
+awk '
+/^[0-9]/ && NF >= 12 && $2 != "CPU" {
+    # mpstat columns (varies by version, but typically):
+    # Time CPU %usr %nice %sys %iowait %irq %soft %steal %guest %gnice %idle
+    usr = $3 + 0;
+    sys = $5 + 0;
+    iowait = $6 + 0;
+    idle = $NF + 0;
+    cpu_used = 100 - idle;
+    cpu_vals[n] = cpu_used;
+    iow_vals[n] = iowait;
+    usr_vals[n] = usr;
+    sys_vals[n] = sys;
+    n++;
+}
+function sort_arr(arr, len,    i, j, tmp) {
+    for (i = 1; i < len; i++) {
+        tmp = arr[i];
+        j = i - 1;
+        while (j >= 0 && arr[j] > tmp) {
+            arr[j+1] = arr[j];
+            j--;
+        }
+        arr[j+1] = tmp;
+    }
+}
+function pct(arr, len, p) {
+    if (len == 0) return 0;
+    idx = int(len * p / 100);
+    if (idx >= len) idx = len - 1;
+    return arr[idx];
+}
+END {
+    if (n == 0) { print "NO_CPU_DATA"; exit; }
+    sort_arr(cpu_vals, n);
+    sort_arr(iow_vals, n);
+    sort_arr(usr_vals, n);
+    sort_arr(sys_vals, n);
+    printf "cpu_p25=%.0f\n", pct(cpu_vals, n, 25);
+    printf "cpu_p50=%.0f\n", pct(cpu_vals, n, 50);
+    printf "cpu_p75=%.0f\n", pct(cpu_vals, n, 75);
+    printf "cpu_p99=%.0f\n", pct(cpu_vals, n, 99);
+    printf "cpu_max=%.0f\n", pct(cpu_vals, n, 100);
+    printf "iowait_p25=%.0f\n", pct(iow_vals, n, 25);
+    printf "iowait_p50=%.0f\n", pct(iow_vals, n, 50);
+    printf "iowait_p75=%.0f\n", pct(iow_vals, n, 75);
+    printf "iowait_p99=%.0f\n", pct(iow_vals, n, 99);
+    printf "iowait_max=%.0f\n", pct(iow_vals, n, 100);
+    printf "usr_avg=%.0f\n", pct(usr_vals, n, 50);
+    printf "sys_avg=%.0f\n", pct(sys_vals, n, 50);
+    printf "cpu_samples=%d\n", n;
+}
+' "$TMPDIR/mpstat.raw" > "$TMPDIR/cpu.summary"
+
+###############################################################################
+# Post-processing: context switches
+###############################################################################
+CONTEXT_SWITCHES=0
+if [[ -n "$CS_BEFORE" && -n "$CS_AFTER" ]]; then
+    CONTEXT_SWITCHES=$((CS_AFTER - CS_BEFORE))
+fi
+CS_PER_SEC=$(awk "BEGIN {d=$DURATION; if(d<=0) d=1; printf \"%.0f\", $CONTEXT_SWITCHES / d}")
+
+###############################################################################
+# Post-processing: CPU thread count from /proc during run
+# (We rely on mpstat samples as a proxy; actual thread count needs /proc polling)
+###############################################################################
+
+###############################################################################
+# Build the report
+###############################################################################
+
+# Load parsed data into shell variables
+eval "$(grep '^[a-z]' "$TMPDIR/blkio.summary" 2>/dev/null)"
+eval "$(grep '^[a-z]' "$TMPDIR/cpu.summary" 2>/dev/null)"
+
+# Helper: format bytes for display
+fmt_bytes() {
+    local b=$1
+    if [[ $b -ge 1048576 ]]; then
+        echo "$(awk "BEGIN {printf \"%.0fM\", $b/1048576}")"
+    elif [[ $b -ge 1024 ]]; then
+        echo "$(awk "BEGIN {printf \"%.0fK\", $b/1024}")"
+    else
+        echo "${b}B"
+    fi
+}
+
+# Helper: format latency for display
+fmt_lat() {
+    local us=$1
+    if [[ $us -ge 1000000 ]]; then
+        awk "BEGIN {printf \"%.1fs\", $us/1000000}"
+    elif [[ $us -ge 1000 ]]; then
+        awk "BEGIN {printf \"%.1fms\", $us/1000}"
+    else
+        echo "${us}us"
+    fi
+}
+
+# Comma-format a number
+fmt_num() {
+    printf "%'d" "$1" 2>/dev/null || echo "$1"
+}
+
+# Build human-readable report
+{
+    echo "=== IO Profile: ${COMMAND_STR} ==="
+    echo "Duration: ${DURATION}s | Device: ${DEVICE} | Kernel: ${KERNEL_VERSION}"
+    echo ""
+    echo "IO Summary:"
+    printf "  Throughput:    Read %.1f MB/s | Write %.1f MB/s\n" "${read_mbs:-0}" "${write_mbs:-0}"
+    printf "  IOPS:          Read %s | Write %s\n" "$(fmt_num "${read_iops:-0}")" "$(fmt_num "${write_iops:-0}")"
+    printf "  IO Threads:    %s\n" "${io_threads:-0}"
+    printf "  R/W Ratio:     %s%% read / %s%% write\n" "${rw_read_pct:-0}" "${rw_write_pct:-0}"
+    printf "  Sequential:    %s%%\n" "${seq_pct:-0}"
+    printf "  fsync calls:   %s (%.1f/s) [fsync=%s fdatasync=%s sync_file_range=%s]\n" \
+        "$(fmt_num "$TOTAL_FSYNC")" "$FSYNC_RATE" \
+        "$(fmt_num "$FSYNC_COUNT")" "$(fmt_num "$FDATASYNC_COUNT")" "$(fmt_num "$SYNC_FILE_RANGE_COUNT")"
+    printf "  O_DIRECT:      %s\n" "$ODIRECT_DETECTED"
+    echo ""
+    echo "Histograms:"
+    printf "  Queue Depth:   p25=%-4s p50=%-4s p75=%-4s p99=%-4s max=%s\n" \
+        "${qdepth_p25:-0}" "${qdepth_p50:-0}" "${qdepth_p75:-0}" "${qdepth_p99:-0}" "${qdepth_max:-0}"
+    printf "  Block Size:    p25=%-4s p50=%-4s p75=%-4s p99=%-4s max=%s\n" \
+        "$(fmt_bytes "${blocksize_p25:-0}")" "$(fmt_bytes "${blocksize_p50:-0}")" \
+        "$(fmt_bytes "${blocksize_p75:-0}")" "$(fmt_bytes "${blocksize_p99:-0}")" \
+        "$(fmt_bytes "${blocksize_max:-0}")"
+    printf "  IO Latency:    p25=%-6s p50=%-6s p75=%-6s p99=%-6s max=%s\n" \
+        "$(fmt_lat "${latency_p25:-0}")" "$(fmt_lat "${latency_p50:-0}")" \
+        "$(fmt_lat "${latency_p75:-0}")" "$(fmt_lat "${latency_p99:-0}")" \
+        "$(fmt_lat "${latency_max:-0}")"
+    echo ""
+    echo "CPU Summary:"
+    printf "  CPU Usage:     p25=%s%% p50=%s%% p75=%s%% p99=%s%%\n" \
+        "${cpu_p25:-0}" "${cpu_p50:-0}" "${cpu_p75:-0}" "${cpu_p99:-0}"
+    printf "  IOWait:        p25=%s%% p50=%s%% p75=%s%% p99=%s%%\n" \
+        "${iowait_p25:-0}" "${iowait_p50:-0}" "${iowait_p75:-0}" "${iowait_p99:-0}"
+    printf "  User/System:   %s%% user / %s%% system\n" "${usr_avg:-0}" "${sys_avg:-0}"
+    printf "  Ctx Switches:  %s/s\n" "$(fmt_num "$CS_PER_SEC")"
+
+    # Per-thread breakdown
+    if [[ -n "${io_threads:-}" && "${io_threads:-0}" -gt 0 ]]; then
+        echo ""
+        echo "Per-Thread IO Breakdown:"
+        printf "  %-24s | %7s | %8s | %9s | %7s | %4s\n" \
+            "Thread" "IOPS" "Read MB" "Write MB" "fsync" "Seq%"
+        printf "  %-24s-|-%7s-|-%8s-|-%9s-|-%7s-|-%4s\n" \
+            "------------------------" "-------" "--------" "---------" "-------" "----"
+        grep '^THREAD ' "$TMPDIR/blkio.summary" | sort -t' ' -k4 -rn | while read -r _ tcomm ttid t_iops t_rmb t_wmb t_seq_pct; do
+            tkey="${tcomm}:${ttid}"
+            t_fsync="${THREAD_FSYNC[$tkey]:-0}"
+            printf "  %-24s | %7s | %8s | %9s | %7s | %3s%%\n" \
+                "${tcomm} (tid ${ttid})" \
+                "$(fmt_num "${t_iops%.*}")" \
+                "${t_rmb}" "${t_wmb}" \
+                "$(fmt_num "$t_fsync")" "${t_seq_pct}"
+        done
+    fi
+} > "$OUTPUT_DIR/report.txt"
+
+# Display the report
+cat "$OUTPUT_DIR/report.txt"
+
+###############################################################################
+# JSON output
+###############################################################################
+if $EMIT_JSON; then
+    # Build per-thread JSON array
+    THREAD_JSON="["
+    first=true
+    while read -r _ tcomm ttid t_iops t_rmb t_wmb t_seq_pct; do
+        tkey="${tcomm}:${ttid}"
+        t_fsync="${THREAD_FSYNC[$tkey]:-0}"
+        if ! $first; then THREAD_JSON+=","; fi
+        first=false
+        THREAD_JSON+=$(printf '{"comm":"%s","tid":%s,"iops":%s,"read_mb":%s,"write_mb":%s,"fsync":%s,"seq_pct":%s}' \
+            "$tcomm" "$ttid" "${t_iops%.*}" "$t_rmb" "$t_wmb" "$t_fsync" "$t_seq_pct")
+    done < <(grep '^THREAD ' "$TMPDIR/blkio.summary" 2>/dev/null | sort -t' ' -k4 -rn)
+    THREAD_JSON+="]"
+
+    cat > "$OUTPUT_DIR/profile.json" <<JSONEOF
+{
+  "metadata": {
+    "command": $(printf '%s' "$COMMAND_STR" | jq -Rs .),
+    "duration_seconds": ${DURATION},
+    "device": "${DEVICE}",
+    "kernel": "${KERNEL_VERSION}",
+    "date": "${DATE_START}",
+    "exit_code": ${CMD_EXIT}
+  },
+  "io_summary": {
+    "throughput": {
+      "read_mbs": ${read_mbs:-0},
+      "write_mbs": ${write_mbs:-0}
+    },
+    "iops": {
+      "read": ${read_iops:-0},
+      "write": ${write_iops:-0}
+    },
+    "io_threads": ${io_threads:-0},
+    "rw_ratio": {
+      "read_pct": ${rw_read_pct:-0},
+      "write_pct": ${rw_write_pct:-0}
+    },
+    "sequential_pct": ${seq_pct:-0},
+    "fsync": {
+      "total": ${TOTAL_FSYNC},
+      "rate_per_sec": ${FSYNC_RATE},
+      "fsync": ${FSYNC_COUNT},
+      "fdatasync": ${FDATASYNC_COUNT},
+      "sync_file_range": ${SYNC_FILE_RANGE_COUNT}
+    },
+    "odirect": {
+      "detected": $([ "$ODIRECT_OPENS" -gt 0 ] && echo "true" || echo "false"),
+      "open_count": ${ODIRECT_OPENS}
+    }
+  },
+  "histograms": {
+    "queue_depth": {
+      "p25": ${qdepth_p25:-0}, "p50": ${qdepth_p50:-0}, "p75": ${qdepth_p75:-0},
+      "p99": ${qdepth_p99:-0}, "max": ${qdepth_max:-0}, "samples": ${qdepth_samples:-0}
+    },
+    "block_size_bytes": {
+      "p25": ${blocksize_p25:-0}, "p50": ${blocksize_p50:-0}, "p75": ${blocksize_p75:-0},
+      "p99": ${blocksize_p99:-0}, "max": ${blocksize_max:-0}, "samples": ${blocksize_samples:-0}
+    },
+    "latency_us": {
+      "p25": ${latency_p25:-0}, "p50": ${latency_p50:-0}, "p75": ${latency_p75:-0},
+      "p99": ${latency_p99:-0}, "max": ${latency_max:-0}, "samples": ${latency_samples:-0}
+    },
+    "cpu_usage_pct": {
+      "p25": ${cpu_p25:-0}, "p50": ${cpu_p50:-0}, "p75": ${cpu_p75:-0},
+      "p99": ${cpu_p99:-0}, "max": ${cpu_max:-0}
+    },
+    "iowait_pct": {
+      "p25": ${iowait_p25:-0}, "p50": ${iowait_p50:-0}, "p75": ${iowait_p75:-0},
+      "p99": ${iowait_p99:-0}, "max": ${iowait_max:-0}
+    }
+  },
+  "cpu": {
+    "user_pct": ${usr_avg:-0},
+    "system_pct": ${sys_avg:-0},
+    "context_switches_per_sec": ${CS_PER_SEC}
+  },
+  "threads": ${THREAD_JSON}
+}
+JSONEOF
+    echo ""
+    echo "JSON profile written to: $OUTPUT_DIR/profile.json"
+fi
+
+echo ""
+echo "Report written to: $OUTPUT_DIR/report.txt"
+exit $CMD_EXIT
