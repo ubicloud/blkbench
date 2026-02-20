@@ -2,11 +2,21 @@
 
 Minimal-overhead I/O benchmarking tool using [libblkio](https://gitlab.com/libblkio/libblkio). Designed for benchmarking vhost-user-blk backends (e.g., ubiblk) with busy-loop polling and direct libblkio calls.
 
-Also includes `io-profile`, a bpftrace-based IO + CPU profiling wrapper that can wrap any command (including blkbench) to produce a system-level profile.
+## Requirements
+
+### blkbench
+
+- [libblkio](https://gitlab.com/libblkio/libblkio) (installed with pkg-config support)
+- GCC
+- pthreads
+
+### io-profile
+
+- `bpftrace` (requires root)
+- `sysstat` (`iostat`, `mpstat`)
+- `awk`
 
 ## Build
-
-Prerequisites: libblkio (installed with pkg-config support), GCC, pthreads.
 
 ```bash
 make
@@ -134,8 +144,6 @@ blkbench: rw=randread, bs=4k, iodepth=32, numjobs=4, runtime=10s
 
 A reusable IO + CPU profiling wrapper. Runs any command and produces a standardized report with block IO metrics, syscall tracking, CPU utilization, and per-thread breakdown.
 
-Requires: `bpftrace` (root), `iostat`, `mpstat`, `awk`.
-
 ### Usage
 
 ```bash
@@ -154,16 +162,10 @@ sudo ./io-profile [options] -- command [args...]
 
 ### Examples
 
-Profile a blkbench run:
 ```bash
-sudo ./io-profile --json -o results/ -- \
-  ./blkbench --driver io_uring --path /tmp/test-disk.raw --rw randread --bs 4k --iodepth 32 --runtime 10
-```
-
-Profile any command:
-```bash
-sudo ./io-profile -d nvme0n1 -- fio job.fio
 sudo ./io-profile -- dd if=/dev/zero of=/tmp/test bs=1M count=1000
+sudo ./io-profile --json -o results/ -- dd if=/dev/sda of=/dev/null bs=4k count=100000
+sudo ./io-profile -d nvme0n1 -- fio job.fio
 ```
 
 ### What it collects
@@ -176,28 +178,28 @@ sudo ./io-profile -- dd if=/dev/zero of=/tmp/test bs=1M count=1000
 ### Example output
 
 ```
-=== IO Profile: ./blkbench --driver io_uring --path /tmp/test-disk.raw --rw randread ... ===
-Duration: 10.2s | Device: nvme0n1 | Kernel: 6.8.0-94-generic
+=== IO Profile: dd if=/dev/zero of=/tmp/test bs=1M count=1000 ===
+Duration: 1.8s | Device: nvme0n1 | Kernel: 6.8.0-94-generic
 
 IO Summary:
-  Throughput:    Read 1250.3 MB/s | Write 0.0 MB/s
-  IOPS:          Read 320,012 | Write 0
-  IO Threads:    4
-  R/W Ratio:     100% read / 0% write
-  Sequential:    12%
+  Throughput:    Read 0.0 MB/s | Write 556.2 MB/s
+  IOPS:          Read 0 | Write 1,012
+  IO Threads:    1
+  R/W Ratio:     0% read / 100% write
+  Sequential:    98%
   fsync calls:   0 (0.0/s)
-  O_DIRECT:      Yes (4 opens)
+  O_DIRECT:      No
 
 Histograms:
-  Queue Depth:   p25=28   p50=31   p75=32   p99=32   max=32
-  Block Size:    p25=4K   p50=4K   p75=4K   p99=4K   max=4K
-  IO Latency:    p25=8us  p50=12us p75=18us p99=45us max=850us
+  Queue Depth:   p25=1    p50=1    p75=1    p99=2    max=2
+  Block Size:    p25=1M   p50=1M   p75=1M   p99=1M   max=1M
+  IO Latency:    p25=0.4ms p50=0.8ms p75=1.2ms p99=3.5ms max=8.1ms
 
 CPU Summary:
-  CPU Usage:     p25=22% p50=25% p75=28% p99=35%
-  IOWait:        p25=0%  p50=0%  p75=1%  p99=2%
-  User/System:   25% user / 0% system
-  Ctx Switches:  12,340/s
+  CPU Usage:     p25=15% p50=18% p75=22% p99=30%
+  IOWait:        p25=8%  p50=12% p75=15% p99=20%
+  User/System:   2% user / 16% system
+  Ctx Switches:  4,520/s
 ```
 
 ## Architecture
