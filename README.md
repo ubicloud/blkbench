@@ -22,7 +22,7 @@ make test
 
 Start ubiblk:
 ```bash
-~/ubiblk/target/release/vhost-backend -f configs/bench.yaml
+~/ubiblk/target/release/vhost-backend -f configs/basic.yaml
 ```
 
 Run benchmark:
