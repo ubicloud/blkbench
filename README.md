@@ -178,28 +178,34 @@ sudo ./io-profile -d nvme0n1 -- fio job.fio
 ### Example output
 
 ```
-=== IO Profile: dd if=/dev/zero of=/tmp/test bs=1M count=1000 ===
-Duration: 1.8s | Device: nvme0n1 | Kernel: 6.8.0-94-generic
+=== IO Profile: dd if=/dev/zero of=/tmp/io-profile-dd-test bs=1M count=500 oflag=dsync ===
+Duration: 0.9s | Device: nvme1n1 | Kernel: 6.8.0-94-generic
 
 IO Summary:
-  Throughput:    Read 0.0 MB/s | Write 556.2 MB/s
-  IOPS:          Read 0 | Write 1,012
-  IO Threads:    1
+  Throughput:    Read 0.0 MB/s | Write 559.9 MB/s
+  IOPS:          Read 4 | Write 5,559
+  IO Threads:    4
   R/W Ratio:     0% read / 100% write
-  Sequential:    98%
-  fsync calls:   0 (0.0/s)
+  Sequential:    79%
+  fsync calls:   1 (1.1/s) [fsync=1 fdatasync=0 sync_file_range=0]
   O_DIRECT:      No
 
 Histograms:
-  Queue Depth:   p25=1    p50=1    p75=1    p99=2    max=2
-  Block Size:    p25=1M   p50=1M   p75=1M   p99=1M   max=1M
-  IO Latency:    p25=0.4ms p50=0.8ms p75=1.2ms p99=3.5ms max=8.1ms
+  Queue Depth:   p25=21   p50=30   p75=33   p99=37   max=37
+  Block Size:    p25=128K p50=128K p75=128K p99=128K max=128K
+  IO Latency:    p25=74us   p50=162us  p75=248us  p99=333us  max=342us
 
 CPU Summary:
-  CPU Usage:     p25=15% p50=18% p75=22% p99=30%
-  IOWait:        p25=8%  p50=12% p75=15% p99=20%
-  User/System:   2% user / 16% system
-  Ctx Switches:  4,520/s
+  CPU Usage:     p25=9% p50=11% p75=11% p99=11%
+  IOWait:        p25=1% p50=1% p75=3% p99=3%
+  User/System:   0% user / 0% system
+  Ctx Switches:  115,467/s
+
+Per-Thread IO Breakdown:
+  Thread                   |    IOPS |  Read MB |  Write MB |   fsync | Seq%
+  -------------------------|---------|----------|-----------|---------|-----
+  dd (tid 1917002)         |   4,446 |      0.0 |     500.0 |       0 |  87%
+  jbd2/nvme1n1p3- (tid 571) |   1,113 |      0.0 |       3.9 |       0 |  50%
 ```
 
 ## Architecture
